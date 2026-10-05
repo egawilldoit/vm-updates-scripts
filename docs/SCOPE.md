@@ -2,14 +2,14 @@
 
 ## In scope
 
-This repository stores and versions the custom VM update scripts used to maintain a small set of developer tools:
+This repository stores and versions the custom VM update scripts used to maintain:
 
 - Codex
 - OpenCode V2
 - Hermes
 - T3 Code
 
-It also stores the tests and documentation needed to understand and safely modify those scripts.
+It also stores the regression tests and concise documentation needed to understand and safely modify those scripts.
 
 ## Out of scope
 
@@ -22,21 +22,25 @@ This repository is not responsible for:
 - mirroring upstream binaries;
 - storing credentials;
 - backing up the VM;
-- managing project repositories that happen to use these tools.
+- managing project repositories that use these tools;
+- acting as a package registry or release service.
 
 ## Operational model
 
-The script is run manually on the VM when an update or verification is wanted.
+The updater is run manually on the VM when an update or verification is wanted.
 
-The GitHub repository is the historical/source archive. It does not need to deploy itself anywhere.
+The GitHub repository is the source/history archive. It does not deploy itself anywhere.
 
-The expected lifecycle is:
+Expected lifecycle:
 
 ```text
 modify script
-→ test
-→ verify
+→ update tests
+→ run regression suite
+→ verify on the VM
 → commit/push
 ```
 
-That is intentionally all.
+Some regression checks are deliberately host-aware and inspect the current VM's systemd/process/runtime layout. That is acceptable because this repository preserves the updater for this host; it is not intended to be a portable updater framework.
+
+Keep the repository boring and small.
