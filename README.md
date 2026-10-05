@@ -6,8 +6,6 @@ This repository is intentionally simple: it exists to **version and preserve the
 
 ## What is stored here
 
-The important files are:
-
 ```text
 scripts/
 ├── update.src.sh
@@ -15,17 +13,17 @@ scripts/
 ```
 
 - `scripts/update.src.sh` is the canonical source for the custom `update` command.
-- `scripts/test-update.sh` is the regression test suite for that script.
+- `scripts/test-update.sh` is the regression suite for that script.
 
-On the VM, the installed command normally lives at:
+On the VM, the installed runtime copy normally lives at:
 
 ```text
 ~/bin/update
 ```
 
-That installed copy is runtime state. This repository stores the source we want to preserve and review.
+The repository is the source/archive. The installed file is runtime state.
 
-## Tools we keep updated
+## Managed tools
 
 The updater currently manages:
 
@@ -34,7 +32,28 @@ The updater currently manages:
 - **Hermes**
 - **T3 Code**
 
-The command supports:
+The full update order is:
+
+```text
+Codex → OpenCode V2 → Hermes → T3
+```
+
+T3 is intentionally last because its updater reconciles and restarts the T3 background service and can interrupt active T3 work.
+
+## Native update commands
+
+The wrapper coordinates the safe lifecycle around the tools' own native updaters:
+
+```text
+Codex      codex update
+OpenCode   opencode upgrade
+Hermes     hermes update --yes --no-backup
+T3         t3 update --channel nightly --yes
+```
+
+Codex may also run `codex app-server daemon update` when capability detection proves that daemon-package lifecycle is supported on the installed Codex build.
+
+## User commands
 
 ```bash
 update --all
@@ -46,20 +65,91 @@ update --verify
 update --dry-run --all
 ```
 
-## Design of the updater
+Individual component updates also support `--dry-run`.
 
-The updater follows a few deliberate rules:
+## Important updater contracts
+
+The current `v2.0.0` baseline deliberately enforces these rules:
 
 - one update authority per managed tool;
-- native tool updaters perform the actual update when available;
-- this script owns interruption, verification, restoration, and cleanup around those native updates;
-- `--verify` must not mutate the machine;
-- `--dry-run` must not mutate the machine;
-- one tool failing should not prevent independent selected tools from being attempted;
-- active tool workloads may be interrupted only when the user explicitly runs the updater;
-- secrets must never be written to this repository or updater logs.
+- native tool updaters perform the actual version change;
+- a single global mutation lock prevents concurrent updater runs;
+- `--verify` performs zero mutation;
+- `--dry-run` performs zero mutation;
+- failures in independent components do not incorrectly gate each other;
+- process/service state is restored only when this updater actually changed it;
+- broad process killing is avoided in favor of identified/owned PIDs;
+- an update is not reported successful until its post-update state is verified;
+- secret-looking values are redacted from updater output/logging.
 
-The current updater also performs tool-specific runtime checks, including service/process identity checks where needed.
+## Tool-specific safety checks
+
+### Codex
+
+The updater does more than check `codex --version`.
+
+It tracks the app-server by the control-socket owner, stops the maintainer/updater before the app-server when required, proves the old process is gone before updating, and requires a fresh post-update instance when a background app-server was running.
+
+A missing legacy `daemon.pid` is not treated as proof that Codex is unmanaged.
+
+### OpenCode V2
+
+The OpenCode path treats the background-service PID and process start time as authoritative. A responding URL alone is not considered proof of process identity.
+
+Before upgrading it proves the old targeted process is gone. If the background service existed before the update, the updater restores it and verifies that the restored process is fresh and belongs to the current installation.
+
+T3 is stopped only when T3 actually owns OpenCode child processes.
+
+### Hermes
+
+Hermes uses its native updater with `--no-backup`. The wrapper records relevant service state and restores only services that were active before the update.
+
+The PM2/web UI is informational and is not started by this updater.
+
+### T3
+
+The T3 update path verifies convergence across multiple surfaces:
+
+- CLI version;
+- launcher target;
+- T3 service-state version;
+- systemd `ExecStart` version;
+- running main-process version;
+- running `t3 serve` version;
+- service active state;
+- HTTP health on `127.0.0.1:3773`;
+- no pending/failed update marker.
+
+The update is only reported successful when those surfaces align.
+
+## Exit codes
+
+```text
+0  success
+1  at least one selected component failed
+2  usage error
+3  global lock contention
+4  preflight refusal; nothing mutated
+5  interrupted; state may be mid-flight
+```
+
+## Tests
+
+Run:
+
+```bash
+bash scripts/test-update.sh
+```
+
+The current suite covers syntax, CLI/exit-code contracts, lock behavior, read-only verification/dry-run, legacy-authority retirement, truthful logging/reporting, Codex lifecycle handling, OpenCode PID/freshness handling, T3 ownership rules, and protection against broad process kills.
+
+The suite is intentionally host-aware. Some tests inspect the current VM's systemd/process layout and installed `~/bin/update`, so it is not intended to be a portable generic test framework.
+
+## Known limitation in the current baseline
+
+The regression suite documents one pre-existing limitation: after `update --all --dry-run`, child processes can briefly inherit the global lock file descriptor, so the lock may remain held for a few seconds after the command exits.
+
+This does not make the dry-run mutate tool state, but it can briefly delay another updater invocation. Do not silently remove or hide this note until the underlying lock-FD inheritance issue is fixed and covered by tests.
 
 ## This repository is NOT
 
@@ -67,55 +157,33 @@ This repository is deliberately **not**:
 
 - a deployment repository;
 - an infrastructure-as-code project;
-- a Docker image or VM image;
+- a Docker/VM image;
 - a CI/CD release system;
 - an automatic scheduler for tool updates;
-- a place for credentials, API keys, service passwords, SSH keys, or environment secrets;
-- a mirror of Codex, OpenCode, Hermes, or T3 binaries.
+- a package mirror;
+- a host backup;
+- a place for credentials, API keys, service passwords, SSH keys, or environment secrets.
 
-GitHub already preserves upstream tool releases. We only preserve **our update logic and its tests**.
+GitHub/upstream projects already preserve the tool releases themselves. This repository preserves **our update logic and tests**.
 
 ## Normal workflow
-
-When the updater needs a change:
 
 ```text
 edit scripts/update.src.sh
         ↓
-update or add regression tests
+update/add regression tests
         ↓
 run scripts/test-update.sh
         ↓
-verify the updater behavior on the VM
+verify behavior on the VM
         ↓
-commit the script + tests here
+commit and push
 ```
 
 No deployment pipeline is required.
 
-## Safety
-
-Do not commit:
-
-- `.env` files;
-- API keys or tokens;
-- OpenCode server passwords;
-- T3 connection credentials;
-- SSH private keys;
-- tool runtime databases/state;
-- logs containing sensitive values.
-
-The updater itself uses restrictive defaults and redacts secret-looking values from its own output, but repository hygiene is still required.
-
 ## Versioning
 
-Use normal Git history as the primary archive.
+Git history is the main archive. Tags may mark important stable updater-script baselines such as `v2.0.0`.
 
-Tags may be created for important stable updater milestones, for example:
-
-```text
-v2.0.0
-v2.0.1
-```
-
-A tag represents a known updater-script baseline, not a deployment release.
+A repository tag represents a version of **our updater script**, not a release of Codex, OpenCode, Hermes, or T3.
