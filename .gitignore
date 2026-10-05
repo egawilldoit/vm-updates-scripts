@@ -1,0 +1,29 @@
+# Secrets and local environment
+.env
+.env.*
+*.env
+*.secret
+*.secrets
+secrets/
+*.key
+*.pem
+
+# Runtime state / logs
+state/
+runtime/
+cache/
+logs/
+*.log
+*.pid
+*.lock
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*~
+
+# Generated / local
+coverage/
+node_modules/
+.DS_Store
