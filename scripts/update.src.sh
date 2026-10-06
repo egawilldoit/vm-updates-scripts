@@ -2972,8 +2972,19 @@ main() {
         exit 0
     fi
 
-    if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
+    UPDATE_ARGV="$*"
+    if [[ $DRY_RUN -eq 1 ]]; then
         acquire_observation_lock
+    else
+        acquire_lock
+    fi
+    install_traps
+
+    # A CURRENT result may suppress an update only while this invocation owns
+    # the exclusive mutation lock. This keeps the local health/version proof
+    # valid through the decision and any subsequent selected update sequence.
+    # Read-only modes return above and retain their observational lock policy.
+    if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
         precheck_selected
         local all_current=1 t
         for t in codex opencode hermes t3; do
@@ -2996,13 +3007,6 @@ main() {
         fi
     fi
 
-    UPDATE_ARGV="$*"
-    if [[ $DRY_RUN -eq 1 ]]; then
-        acquire_observation_lock
-    else
-        acquire_lock
-    fi
-    install_traps
     start_logging
 
     local run_id

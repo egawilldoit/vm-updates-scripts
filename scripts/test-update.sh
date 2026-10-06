@@ -1736,5 +1736,98 @@ bash "$LOG_FIX/prune.sh"
 [[ -f "$LOG_FIX/logs/keep-me.txt" ]] && ok "pruning leaves unrelated files" || bad "unrelated file removed"
 check "pruning skips read-only modes" "grep -q 'DRY_RUN -eq 0 && \$DO_VERIFY -eq 0 && \$DO_CHECK -eq 0' $U"
 
+printf '\n=== 43. CURRENT prechecks serialize with the mutation lock ==='
+LOCKSEQ="$(mktemp -d /tmp/update-lock-sequence.XXXXXX)"
+python3 - "$U" "$LOCKSEQ/harness.sh" <<'LOCKSEQPY'
+import sys
+s=open(sys.argv[1]).read()
+def extract(name):
+    i=s.index(name); brace=s.index('{',i); depth=0
+    for j in range(brace,len(s)):
+        if s[j]=='{': depth+=1
+        elif s[j]=='}':
+            depth-=1
+            if depth==0: return s[i:j+1]
+    raise SystemExit('could not extract '+name)
+lock=extract('acquire_lock() {')
+exit_trap=extract('on_exit() {')
+main=extract('main() {')
+opencode=extract('do_opencode_update() {')
+pre='''#!/usr/bin/env bash
+set -o pipefail
+HOME="${HOME:?}"; STATE_ROOT="$HOME/.local/state/tool-updates"; GLOBAL_LOCK="$STATE_ROOT/update.lock"
+LOCK_HELD=0; LOG_FH_OPEN=0; ACTIVE_LOG=""; DRY_RUN=0; DO_VERIFY=0; DO_CHECK=0; FORCE_UPDATE=0
+DO_CODEX=0; DO_OPENCODE=0; DO_HERMES=0; DO_T3=0; OBS_LOCK_BUSY=0; UPDATE_ARGV=""
+declare -A PRECHECK=() PRECHECK_DETAIL=() RESULT=() RESULT_DETAIL=()
+TRACE="$HOME/trace"; OPENCODE_BIN=/fake/opencode; CODEX_BIN=""; HERMES_BIN=""; T3_BIN=""
+C_BOLD=""; C_RESET=""; C_YEL=""; C_CYN=""; C_GRN=""; C_RED=""; C_DIM=""
+err(){ printf '%s\\n' "$*" >&2; }
+warn(){ :; }
+info(){ :; }
+section(){ :; }
+record(){ RESULT[$1]="$2"; RESULT_DETAIL[$1]="$3"; printf 'record %s %s %s\\n' "$@" >>"$TRACE"; }
+status_line(){ printf 'status %s %s %s\\n' "$@" >>"$TRACE"; }
+start_logging(){ : >"$HOME/logging-started"; }
+install_traps(){ trap on_exit EXIT; }
+precheck_tool(){ [[ -n "${PRECHECK[$1]:-}" ]] && return 0; }
+parse_args(){
+  case "$TEST_CASE" in
+    allcurrent) DO_OPENCODE=1 ;;
+    mixed) DO_OPENCODE=1; DO_T3=1 ;;
+  esac
+}
+precheck_selected(){
+  if ( exec 8>>"$GLOBAL_LOCK"; flock -n 8 ); then printf 'precheck-lock=FREE\\n' >>"$TRACE"; else printf 'precheck-lock=HELD\\n' >>"$TRACE"; fi
+  PRECHECK[opencode]=CURRENT; PRECHECK_DETAIL[opencode]='stub current'
+  if [[ $DO_T3 -eq 1 ]]; then PRECHECK[t3]=UNKNOWN; PRECHECK_DETAIL[t3]='stub unknown'; fi
+}
+do_t3_update(){
+  if ( exec 8>>"$GLOBAL_LOCK"; flock -n 8 ); then printf 't3-lock=FREE\\n' >>"$TRACE"; else printf 't3-lock=HELD\\n' >>"$TRACE"; fi
+  [[ "${PRECHECK[t3]}" == UNKNOWN ]] && printf 't3-native-path=EXECUTED\\n' >>"$TRACE"
+  RESULT[t3]=PASS; UPDATE_RC[t3]=0
+}
+do_codex_update(){ printf 'codex-native\\n' >>"$TRACE"; }
+do_hermes_update(){ printf 'hermes-native\\n' >>"$TRACE"; }
+cleanup_t3_runtimes(){ :; }
+cleanup_codex_releases(){ :; }
+verify_codex(){ :; }; verify_opencode(){ :; }; verify_hermes(){ :; }; verify_t3(){ :; }
+prune_update_logs(){ :; }
+print_summary(){ :; }
+'''
+with open(sys.argv[2],'w') as f:
+    f.write(pre+lock+'\n'+exit_trap+'\n'+opencode+'\n'+main+'\nmain "$@"\n')
+LOCKSEQPY
+chmod +x "$LOCKSEQ/harness.sh"
+
+ALLCURRENT_HOME="$LOCKSEQ/all-current"; mkdir -p "$ALLCURRENT_HOME"
+TEST_CASE=allcurrent HOME="$ALLCURRENT_HOME" "$LOCKSEQ/harness.sh" >"$LOCKSEQ/all-current.out" 2>&1
+AC_RC=$?
+[[ $AC_RC -eq 0 ]] && ok "all-CURRENT decision exits 0" || bad "all-CURRENT exit $AC_RC"
+grep -q '^precheck-lock=HELD$' "$ALLCURRENT_HOME/trace" && ok "CURRENT was accepted under exclusive lock" || bad "CURRENT decision was outside exclusive lock"
+[[ ! -e "$ALLCURRENT_HOME/.local/state/tool-updates/update.lock.holder" ]] && ok "all-CURRENT exit removes lock-holder file" || bad "all-CURRENT left holder behind"
+[[ ! -e "$ALLCURRENT_HOME/logging-started" ]] && ok "all-CURRENT exit starts no log" || bad "all-CURRENT started logging"
+! grep -qE 'native|t3-lock|codex-lock|hermes-lock' "$ALLCURRENT_HOME/trace" && ok "all-CURRENT invokes no update path" || bad "all-CURRENT invoked an update path"
+grep -q 'already current' "$ALLCURRENT_HOME/trace" && ok "all-CURRENT reports PASS already-current" || bad "all-CURRENT report missing"
+
+MIXED_HOME="$LOCKSEQ/mixed"; mkdir -p "$MIXED_HOME"
+TEST_CASE=mixed HOME="$MIXED_HOME" "$LOCKSEQ/harness.sh" >"$LOCKSEQ/mixed.out" 2>&1
+MIX_RC=$?
+[[ $MIX_RC -eq 0 ]] && ok "mixed CURRENT/UNKNOWN run reaches selected paths" || bad "mixed run exit $MIX_RC"
+grep -q '^precheck-lock=HELD$' "$MIXED_HOME/trace" && ok "mixed decision is made under exclusive lock" || bad "mixed decision was not locked"
+grep -q '^t3-lock=HELD$' "$MIXED_HOME/trace" && ok "exclusive lock spans the mixed update sequence" || bad "mixed sequence lost its lock"
+grep -q '^t3-native-path=EXECUTED$' "$MIXED_HOME/trace" && ok "T3 UNKNOWN continues through its native path" || bad "T3 UNKNOWN was incorrectly skipped"
+if grep -q '^Running: opencode upgrade$' "$MIXED_HOME/trace"; then bad "OpenCode CURRENT reached native upgrade"; else ok "OpenCode CURRENT skips native upgrade"; fi
+[[ ! -e "$MIXED_HOME/.local/state/tool-updates/update.lock.holder" ]] && ok "mixed run cleans lock-holder on exit" || bad "mixed run left holder behind"
+
+CONTEND_HOME="$LOCKSEQ/contended"; mkdir -p "$CONTEND_HOME/.local/state/tool-updates"
+: >"$CONTEND_HOME/.local/state/tool-updates/update.lock"
+exec 8>>"$CONTEND_HOME/.local/state/tool-updates/update.lock"; flock -n 8
+TEST_CASE=allcurrent HOME="$CONTEND_HOME" "$LOCKSEQ/harness.sh" >"$LOCKSEQ/contended.out" 2>&1
+CONTEND_RC=$?
+exec 8>&-
+[[ $CONTEND_RC -eq 3 ]] && ok "owned mutation lock exits 3 before precheck" || bad "contended update exit $CONTEND_RC"
+[[ ! -e "$CONTEND_HOME/trace" ]] && ok "contended updater never accepts CURRENT" || bad "contended updater reached precheck"
+[[ ! -e "$CONTEND_HOME/.local/state/tool-updates/update.lock.holder" ]] && ok "contended updater creates no holder" || bad "contended updater left holder"
+
 printf '\n--- %d passed, %d failed ---\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
