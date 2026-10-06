@@ -52,22 +52,30 @@ Do not silently add another managed tool.
 5. **Read-only dry-run.**
    `update --dry-run ...` performs zero tool-state mutation and must describe the intended plan truthfully.
 
-6. **Global mutual exclusion.**
+   Dry-run uses only a best-effort shared observation of an existing lock. It never creates the lock, holder, or logs; its snapshot can become stale if a mutation starts concurrently.
+
+6. **Read-only availability check.**
+   `update --check` creates no lock or logs. `CURRENT` requires proof; `UNKNOWN` must continue through the native updater on a normal update.
+
+7. **Force means native update.**
+   `--force` bypasses only a proven-current skip. It does not bypass lifecycle proofs, restoration, verification, or locking.
+
+8. **Global mutual exclusion.**
    Mutating updater runs use the single global lock. Preserve exit code 3 for lock contention.
 
-7. **Independent components stay independent.**
+9. **Independent components stay independent.**
    A failure in one selected component must not cause unrelated components to be skipped or falsely marked failed.
 
-8. **Restore only what this run changed.**
+10. **Restore only what this run changed.**
    Do not start/restart a service merely because it exists. Restore it only when the updater stopped it or it was active before the relevant update path.
 
-9. **Targeted process handling.**
+11. **Targeted process handling.**
    Avoid broad `pkill`, `killall`, or signal-by-name patterns. Prefer proven process ownership/identity and targeted PIDs.
 
-10. **Truthful post-update verification.**
+12. **Truthful post-update verification.**
     Never report success because an updater command returned 0 alone. Verify the required post-conditions.
 
-11. **No secret leakage.**
+13. **No secret leakage.**
     Never commit credentials and do not weaken output/log redaction.
 
 ## Tool-specific invariants
@@ -104,12 +112,10 @@ Do not silently add another managed tool.
 - Native update is `t3 update --channel nightly --yes`.
 - Do not use deprecated `t3 service update` as the normal update mechanism.
 - Post-update verification must align CLI, launcher, service-state, systemd ExecStart, MainPID, running serve version, HTTP health, and pending-update state.
+- Preserve the bounded post-update health convergence wait; the native updater can return before HTTP becomes ready.
+- Before a real restart, report category counts for workloads in the service cgroup. Never terminate those processes independently.
 
-## Known baseline limitation
-
-The test suite documents a pre-existing issue where `update --all --dry-run` can leave the global lock FD inherited by child processes for a few seconds after the command exits.
-
-Do not describe this as fixed unless the underlying behavior is changed and a regression test proves it.
+Availability checks must use the native updater's authoritative channel. If that cannot be established safely, return `UNKNOWN` and run the native updater.
 
 ## Change discipline
 

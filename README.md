@@ -62,20 +62,26 @@ update --opencode
 update --hermes
 update --t3
 update --verify
+update --check
 update --dry-run --all
+update --force --all
 ```
 
 Individual component updates also support `--dry-run`.
 
 ## Important updater contracts
 
-The current `v2.0.0` baseline deliberately enforces these rules:
+The `v2.1.0` updater enforces these rules:
 
 - one update authority per managed tool;
 - native tool updaters perform the actual version change;
 - a single global mutation lock prevents concurrent updater runs;
 - `--verify` performs zero mutation;
 - `--dry-run` performs zero mutation;
+- `--check` reports `CURRENT`, `UPDATE_AVAILABLE`, `UNKNOWN`, or `NOT_CONFIGURED` without creating locks or logs;
+- normal updates skip disruption only when `CURRENT` is proven; `UNKNOWN` runs the existing native updater;
+- `--force` bypasses only the current-version optimization and preserves all lifecycle safety checks;
+- updater logs retain the newest 20 updater-owned log files;
 - failures in independent components do not incorrectly gate each other;
 - process/service state is restored only when this updater actually changed it;
 - broad process killing is avoided in favor of identified/owned PIDs;
@@ -145,11 +151,9 @@ The current suite covers syntax, CLI/exit-code contracts, lock behavior, read-on
 
 The suite is intentionally host-aware. Some tests inspect the current VM's systemd/process layout and installed `~/bin/update`, so it is not intended to be a portable generic test framework.
 
-## Known limitation in the current baseline
+`--check` currently has authoritative latest data only for OpenCode, using the npm registry package that `opencode upgrade` manages. Codex, Hermes, and T3 report `UNKNOWN` until a safe read-only lookup on their native update channel can be proven. T3 latest-state uncertainty never suppresses reconciliation.
 
-The regression suite documents one pre-existing limitation: after `update --all --dry-run`, child processes can briefly inherit the global lock file descriptor, so the lock may remain held for a few seconds after the command exits.
-
-This does not make the dry-run mutate tool state, but it can briefly delay another updater invocation. Do not silently remove or hide this note until the underlying lock-FD inheritance issue is fixed and covered by tests.
+`--dry-run` never creates an update lock, holder file, or log. It makes an observational plan that may become stale if a mutating updater starts concurrently.
 
 ## This repository is NOT
 

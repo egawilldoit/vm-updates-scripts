@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.1.0 — 2026-10-06
+
+### Fixed
+
+- OpenCode official commands preserve the requested service subcommand and classify command success by exit status; lifecycle proofs remain authoritative.
+- OpenCode service and native updater children close lock fd 9.
+- Dry-run no longer creates/acquires the mutation lock, holder file, or logs; it uses only a best-effort read-only observation of an existing lock.
+- Removed the documented dry-run lock-FD limitation after reproducing the prior inheritance and adding direct regression coverage.
+
+### Added
+
+- Conservative per-tool `CURRENT` / `UPDATE_AVAILABLE` / `UNKNOWN` / `NOT_CONFIGURED` availability reporting and `update --check`.
+- `--force` to bypass only a proven-current optimization.
+- T3 pre-restart workload category counts and bounded updater-log retention (20 logs).
+- Read-only availability is authoritative only for OpenCode's npm package channel at present; unresolved sources stay `UNKNOWN` and do not skip native updates.
+
 ## v2.0.0 baseline — 2026-10-05
 
 Initial archived baseline of the current VM updater.
@@ -61,10 +77,10 @@ Managed tools:
 
 ### Tests
 
-The regression suite covers 40 named sections, including syntax/CLI contracts, lock behavior, read-only verification/dry-run, logging, Codex lifecycle, OpenCode lifecycle, T3 ownership semantics, signal restoration, source/runtime identity, and protection against broad process kills.
+The regression suite covers the original 40 named sections plus new OpenCode argv/fd/classification, dry-run locking, availability/force contracts, T3 workload warning, and log retention checks.
 
-### Known baseline limitation
+### Known limitation at the v2.0.0 baseline
 
-A pre-existing issue remains documented in the test suite: `update --all --dry-run` may leave the global lock FD inherited by child processes for a few seconds after the command exits.
+At v2.0.0, `update --all --dry-run` could leave the global lock fd inherited by children briefly. This limitation is fixed in v2.1.0 as described above.
 
 This changelog tracks the updater script itself. It is not a deployment/release log for the managed tools.

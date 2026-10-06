@@ -11,6 +11,8 @@ This repository stores and versions the custom VM update scripts used to maintai
 
 It also stores the regression tests and concise documentation needed to understand and safely modify those scripts.
 
+The updater may perform read-only availability checks for each native update channel. An unproven latest source is reported as `UNKNOWN` and never used to suppress an update. T3 restart warnings may report bounded workload category counts from its service cgroup.
+
 ## Out of scope
 
 This repository is not responsible for:
