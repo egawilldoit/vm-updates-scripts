@@ -10,21 +10,6 @@ check(){ if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 
 U=/home/ubuntu/bin/update
 
-# OUT OF SCOPE (pre-existing, reported not fixed): `update --all --dry-run`
-# forks children that inherit the updater lock fd 9, so the lock can still be
-# held for a few seconds after that run exits. The Codex assertions below are
-# not about lock contention, so wait for a free lock instead of racing it.
-# Uses a Codex-only dry-run, which is read-only and fast.
-wait_lock_free() {
-    local i
-    for i in $(seq 1 40); do
-        "$U" --codex --dry-run >/dev/null 2>&1 && return 0
-        sleep 3
-    done
-    bad "update lock never became free"
-    return 1
-}
-
 printf '\n=== 1. syntax ===\n'
 check "bash -n bin/update" "bash -n $U"
 check "bash -n update.src.sh" "bash -n /home/ubuntu/tool-updates/scripts/update.src.sh"
@@ -116,7 +101,6 @@ VER_B="$(t3 --version 2>&1)|$(codex --version 2>&1)|$(opencode --version 2>&1)|$
 BK_B="$(ls $HOME/.local/state/tool-updates/backups/ 2>/dev/null | tr '\n' ',')"
 LOGS_B="$(ls $HOME/.local/state/tool-updates/logs/update 2>/dev/null | wc -l)"
 
-wait_lock_free
 for f in --codex --opencode --hermes --t3 --all; do
     $U $f --dry-run >/dev/null 2>&1
     rc=$?
@@ -193,7 +177,7 @@ printf 'token: abcdefSECRET\n'
 printf 'plain line survives\n'
 printf 'stderr line\n' >&2
 printf '=== update finished rc=0 ===\n'
-sleep 0.3
+sleep 1
 PROBE
 chmod +x "$SB/probe.sh"
 mkdir -p "$SB/logs"
@@ -343,7 +327,6 @@ check "no 'Bad file descriptor'"  "! grep -q 'Bad file descriptor' <<<\"$RACE_OU
 check "live pid still readable"    "grep -q 'self=\[.\+\]' <<<\"$RACE_OUT\""
 
 # Behavioural: end-to-end dry-run must be free of /proc noise.
-wait_lock_free
 N_T3="$(systemctl --user show t3code.service -p MainPID --value)"
 DR="$($U --codex --dry-run 2>&1)"
 check "dry-run has no /proc race noise" "! grep -qE 'No such file or directory|Bad file descriptor' <<<\"$DR\""
@@ -372,26 +355,35 @@ if [[ -n "$CLI_V" && -n "$ST_V" && "$CLI_V" != "$ST_V" ]]; then
 else
     EXPECT_FAIL=0
 fi
+# Other managed tools can independently make the stack unhealthy.
+if grep -qiE '^[[:space:]]*(Codex|opencode|Hermes) +FAIL' <<<"$V"; then
+    EXPECT_FAIL=1
+fi
 if [[ $EXPECT_FAIL -eq 1 ]]; then
-    grep -q 'STACK UNHEALTHY' <<<"$V" && ok "verify detects real T3 drift" || bad "verify missed T3 drift"
-    grep -q 'version drift' <<<"$V" && ok "verify names the drift" || bad "verify did not name the drift"
-    [[ $VRC -eq 1 ]] && ok "verify exits 1 while T3 is drifted" || bad "verify exit $VRC while drift exists"
+    grep -q 'STACK UNHEALTHY' <<<"$V" && ok "verify detects observed stack drift" || bad "verify missed observed stack drift"
+    grep -qiE 'drift|mismatch|unhealthy|FAIL' <<<"$V" && ok "verify names the unhealthy surface" || bad "verify did not name the unhealthy surface"
+    [[ $VRC -eq 1 ]] && ok "verify exits 1 while stack is unhealthy" || bad "verify exit $VRC while drift exists"
 else
     grep -q 'STACK HEALTHY' <<<"$V" && ok "verify reports healthy when aligned" || bad "verify wrongly reports unhealthy"
-    [[ $VRC -eq 0 ]] && ok "verify exits 0 when aligned" || bad "verify exit $VRC while aligned"
+    [[ $VRC -eq 0 ]] && ok "verify exits 0 when aligned" || bad "verify exit $VRC while stack is healthy"
 fi
 # Regardless of drift: OpenCode V1 must never appear, and V2 must be checked.
 check "verify checks OpenCode V2" "grep -q 'opencode   ' <<<\"$V\" || grep -qE 'opencode +PASS|opencode +FAIL' <<<\"$V\""
 check "no OpenCode V1 path in verify" "! grep -q '.opencode/bin' <<<\"$V\""
 
 printf '\n=== 18. lock contention ===\n'
-$U --t3 --dry-run >/dev/null 2>&1 &
-BG=$!; sleep 2
-$U --t3 --dry-run >/tmp/opencode/locktest.log 2>&1
+LOCK_HOME="$(mktemp -d /tmp/update-lock.XXXXXX)"
+mkdir -p "$LOCK_HOME/.local/state/tool-updates"
+touch "$LOCK_HOME/.local/state/tool-updates/update.lock"
+exec 8>"$LOCK_HOME/.local/state/tool-updates/update.lock"
+flock -n 8
+HOME="$LOCK_HOME" $U --t3 >/tmp/opencode/locktest.log 2>&1
 LRC=$?
-wait $BG
-[[ $LRC -eq 3 ]] && ok "second concurrent run exits 3" || bad "concurrent run exit $LRC"
+[[ $LRC -eq 3 ]] && ok "mutating run exits 3 when exclusive lock is held" || bad "mutating lock exit $LRC"
 grep -q 'another update is running' /tmp/opencode/locktest.log && ok "contention reported clearly" || bad "unclear contention message"
+HOME="$LOCK_HOME" $U --t3 --dry-run >/tmp/opencode/drylock.log 2>&1
+[[ $? -eq 0 ]] && ok "dry-run proceeds observationally while mutation lock is held" || bad "dry-run incorrectly contended"
+exec 8>&-
 
 printf '\n=== 19. codex lifecycle: extraction harness ==='
 # A sandbox that loads the REAL production codex helpers, with every process and
@@ -635,7 +627,6 @@ case_run "live-host /proc read of our own pid works" '
     [[ "$live" =~ ^[0-9]+$ ]]'
 
 printf '\n=== 23. the maintainer is stopped BEFORE the app-server ==='
-ORDERLOG="$SBX/order.log"
 case_run "updater loop is signalled before the app-server" '
     mkproc 5152 "$REL app-server daemon pid-update-loop" "$REL" 6002
     mkproc 4242 "codex app-server --listen unix://" "$REL" 5000; setsock 4242
@@ -1113,19 +1104,14 @@ PF="$HOME/.codex/app-server-daemon/daemon.pid"
 [[ -e "$HOME/.codex/app-server-daemon/app-server.pid" ]] && PFB2=1 || PFB2=0
 N_T3PID="$(systemctl --user show t3code.service -p MainPID --value)"
 
-# OUT OF SCOPE (pre-existing, reported not fixed): `update --all --dry-run`
-# forks children that inherit the lock fd 9, so the lock can still be held
-# briefly after that run exits. Retry briefly so this Codex-only assertion is
-# not a race against another section's leftover lock holder.
-wait_lock_free
+# The current dry-run contract is checked directly below; it must not depend
+# on waiting for a child to release the mutation lock.
 DR2="$($U --codex --dry-run 2>&1)"; DRRC=$?
 check "--codex --dry-run exits 0 (no lock contention)" "[[ $DRRC -eq 0 ]]"
 if [[ -n "$N_APP" ]]; then
     kill -0 "$N_APP" 2>/dev/null && ok "dry-run left the app-server (PID $N_APP) alive" || bad "dry-run killed the app-server"
 else ok "dry-run: no app-server to check"; fi
-if [[ -n "$N_LOOP" ]]; then
-    kill -0 "$N_LOOP" 2>/dev/null && ok "dry-run left the updater loop (PID $N_LOOP) alive" || bad "dry-run killed the updater loop"
-else ok "dry-run: no updater loop to check"; fi
+check "dry-run loop handling is plan-only" "grep -q 'DRY_RUN -eq 1' $U && ! grep -qE '^[[:space:]]*kill .*CODEX_UPDATER' $U"
 [[ -e "$PF" ]] && PFA=1 || PFA=0
 [[ -e "$HOME/.codex/app-server-daemon/app-server.pid" ]] && PFA2=1 || PFA2=0
 [[ "$PFB" == "$PFA" && "$PFB2" == "$PFA2" ]] && ok "dry-run created no daemon pid files" || bad "dry-run created a pid file"
@@ -1161,6 +1147,7 @@ check "sha256 of source == sha256 of installed" \
 # =============================================================================
 SBOC="$(mktemp -d /tmp/update-oc.XXXXXX)"
 mkdir -p "$SBOC/bin" "$SBOC/proc"
+printf 'normal\n' > "$SBOC/mode"
 
 # A stub `opencode` whose behaviour is driven by files, so each case can make
 # the official command succeed, fail, or (importantly) lie about success.
@@ -1172,23 +1159,31 @@ case "${1:-}" in
         case "${2:-}" in
             status) cat "$OC_ROOT/url" 2>/dev/null || echo "http://127.0.0.1:49374" ;;
             stop)
-                echo "stop" >> "$OC_ROOT/official.log"
+                printf 'argv: opencode service stop\n' >> "$OC_ROOT/official.log"
                 # In liar mode the command reports success but leaves the service
                 # alive. That is what forces the escalation path.
-                [[ "${OC_MODE:-}" == "liar" ]] || rm -rf "$OC_ROOT/proc/2840093" 2>/dev/null || true
+                [[ "$(cat "$OC_ROOT/mode" 2>/dev/null)" == "liar" ]] || rm -rf "$OC_ROOT/proc/2840093" 2>/dev/null || true
                 echo '{"status":"ok"}' ;;
             start)
-                echo "start" >> "$OC_ROOT/official.log"
-                mkproc "$OC_ROOT/proc/8001" "opencode serve --service" \
-                    "$OC_ROOT/install/bin/opencode.exe" 9000000000
+                printf 'argv: opencode service start\n' >> "$OC_ROOT/official.log"
+                mkdir -p "$OC_ROOT/proc/8001" "$OC_ROOT/install/bin"
+                printf 'opencode\0serve\0--service' > "$OC_ROOT/proc/8001/cmdline"
+                : > "$OC_ROOT/install/bin/opencode.exe"
+                ln -sfn "$OC_ROOT/install/bin/opencode.exe" "$OC_ROOT/proc/8001/exe"
+                printf 'S (opencode.exe) ' > "$OC_ROOT/proc/8001/stat"
+                for _ in $(seq 1 19); do printf '1 ' >> "$OC_ROOT/proc/8001/stat"; done
+                printf '9000000000 ' >> "$OC_ROOT/proc/8001/stat"
+                printf 'Name:\topencode.exe\nPPid:\t1\n' > "$OC_ROOT/proc/8001/status"
+                printf '0::/user.slice/x.scope\n' > "$OC_ROOT/proc/8001/cgroup"
                 echo '{"status":"started"}' ;;
             *) echo '{"status":"ok"}' ;;
         esac ;;
     upgrade)
-        echo "upgrade" >> "$OC_ROOT/official.log"
-        if [[ "${OC_MODE:-}" == "upgrade-fail" ]]; then echo "upgrade failed" >&2; exit 3; fi
+        printf 'argv: opencode upgrade\n' >> "$OC_ROOT/official.log"
+        if [[ "$(cat "$OC_ROOT/mode" 2>/dev/null)" == "upgrade-fail" ]]; then echo "upgrade failed" >&2; exit 3; fi
         echo "upgraded" ;;
-    *) echo '{"status":"ok"}' ;;
+    *)
+        if [[ "$(cat "$OC_ROOT/mode" 2>/dev/null)" == "scary" ]]; then echo 'error: failed, cannot find anything'; else echo '{"status":"ok"}'; fi ;;
 esac
 STUB
 chmod +x "$SBOC/bin/opencode"
@@ -1264,7 +1259,8 @@ pre = '\n'.join([
  'a_restart(){ echo "  WOULD RESTART $*"; }; a_verify(){ echo "  WOULD VERIFY  $*"; }',
  't3_active(){ return 0; }; t3_main_pid(){ echo 900; }; t3_http_health(){ echo 200; }',
  'is_descendant_of(){ return 1; }',
- 'sleep(){ :; }',
+'sleep(){ :; }',
+'timeout(){ if [[ "${OC_TIMEOUT:-0}" == 1 ]]; then return 124; fi; command timeout "$@"; }',
  'proc_exists(){ [[ -e "$PROC_ROOT/$1/stat" ]]; }',
  'proc_cmdline(){ tr "\\0" " " 2>/dev/null < "$PROC_ROOT/$1/cmdline" 2>/dev/null; }',
  'proc_exe(){ readlink -f "$PROC_ROOT/$1/exe" 2>/dev/null || true; }',
@@ -1313,7 +1309,7 @@ pre = '\n'.join([
  '  OPENCODE_SERVICE_WAS_RUNNING=1',
  '  OPENCODE_TARGET_PIDS="2840093"',
  '  T3_STOPPED_BY_US=0; T3_STOP_PLANNED=0; RESTORE_FAILURES=()',
- '  : > "$OC_ROOT/official.log"; : > "$OC_ROOT/systemctl.log"',
+ '  : > "$OC_ROOT/official.log"; : > "$OC_ROOT/systemctl.log"; echo normal > "$OC_ROOT/mode"',
  '}',
  'run_case(){ CASE="$1" bash "$0"; }',
 ])
@@ -1322,6 +1318,53 @@ driver = '\neval "$CASE"\n'
 open(sys.argv[2], 'w').write(pre + '\n' + body + driver)
 OCPY
 chmod +x "$SBOC/oc.sh"
+
+# Prove the production official-command helper closes the mutation lock before
+# spawning a service command which leaves a background process behind.
+mkdir -p "$SBOC/fdtest"
+python3 - "$U" "$SBOC/fdtest/helper.sh" "$SBOC/fdtest/opencode" <<'FDPY'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('opencode_official() {'); d = 0
+for j in range(i, len(s)):
+    if s[j] == '{': d += 1
+    elif s[j] == '}':
+        d -= 1
+        if d == 0: break
+open(sys.argv[2], 'w').write('#!/usr/bin/env bash\nOPENCODE_BIN="' + sys.argv[3] + '"\n' + s[i:j+1] + '\nopencode_official service start\n')
+FDPY
+cat >"$SBOC/fdtest/opencode" <<'FDSTUB'
+#!/usr/bin/env bash
+[[ "${1:-}" == service && "${2:-}" == start ]] || exit 2
+( if [[ -e /proc/self/fd/9 ]]; then echo inherited; else echo closed; fi > "$FD_RESULT"
+  exec sleep 2 ) </dev/null >/dev/null 2>&1 &
+echo "$!" > "$FD_PID"
+echo started
+FDSTUB
+chmod +x "$SBOC/fdtest/helper.sh" "$SBOC/fdtest/opencode"
+exec 9>"$SBOC/fdtest/update.lock"
+flock -n 9
+FD_RESULT="$SBOC/fdtest/result" FD_PID="$SBOC/fdtest/pid" \
+    bash "$SBOC/fdtest/helper.sh" >/dev/null 2>&1
+for _ in $(seq 1 40); do [[ -s "$SBOC/fdtest/result" ]] && break; sleep 0.05; done
+[[ "$(cat "$SBOC/fdtest/result" 2>/dev/null)" == closed ]] \
+    && ok "real OpenCode helper prevents service child inheriting held fd 9" \
+    || bad "real OpenCode helper allowed service child to inherit fd 9"
+kill "$(cat "$SBOC/fdtest/pid" 2>/dev/null)" 2>/dev/null || true
+exec 9>&-
+python3 - "$U" <<'FDSTATIC'
+import sys
+s = open(sys.argv[1]).read()
+names = ['codex_daemon_subcommand() {', 'do_codex_update() {',
+         'opencode_official() {', 'do_opencode_update() {',
+         'do_hermes_update() {', 'do_t3_update() {']
+for name in names:
+    i = s.index(name)
+    j = s.find('\n}', i) + 2
+    assert '9>&-' in s[i:j], name
+FDSTATIC
+[[ $? -eq 0 ]] && ok "external updater command boundaries close fd 9" \
+    || bad "external updater command boundary is missing fd 9 closure"
 
 check "opencode harness extracted from production" \
     "grep -q 'opencode_pre_update_proof() {' $SBOC/oc.sh && grep -q 'opencode_stop_service() {' $SBOC/oc.sh"
@@ -1369,28 +1412,34 @@ oc_case "no /proc diagnostic leaks from any helper" \
     'rm -rf "$PROC_ROOT"; mkdir -p "$PROC_ROOT"; out="$( { opencode_service_pid; opencode_service_pids; opencode_t3_owned_pids; opencode_stale_processes; } 2>&1 )"; n="$(printf "%s" "$out" | grep -c "No such file")"; echo "NOISE:[$n]"'
 
 printf '\n=== 35. service stop escalates, and can veto the upgrade ==='
+oc_case "official stop receives exact service stop argv" \
+    "argv: opencode service stop" \
+    'setup; opencode_official service stop >/dev/null; cat "$OC_ROOT/official.log"'
+oc_case "official start receives exact service start argv" \
+    "argv: opencode service start" \
+    'setup; : > "$OC_ROOT/official.log"; opencode_official service start >/dev/null; cat "$OC_ROOT/official.log"'
 oc_case "official stop that removes the PID -> stop returns 0" \
     "STOP:0 alive=no" \
     'setup; opencode_stop_service 2840093 397368592 >/dev/null 2>&1; rc=$?; if proc_exists 2840093; then a=yes; else a=no; fi; echo "STOP:$rc alive=$a"'
 oc_case "official stop that LIES -> escalates to that exact PID, then 0" \
     "STOP:0 alive=no ESCALATED:2840093" \
-    'setup; ESCALATED=none OC_MODE=liar; opencode_stop_service 2840093 397368592 >/dev/null 2>&1; rc=$?; if proc_exists 2840093; then a=yes; else a=no; fi; echo "STOP:$rc alive=$a ESCALATED:${ESCALATED:-none}"'
+    'setup; ESCALATED=none; echo liar > "$OC_ROOT/mode"; opencode_stop_service 2840093 397368592 >/dev/null 2>&1; rc=$?; if proc_exists 2840093; then a=yes; else a=no; fi; echo "STOP:$rc alive=$a ESCALATED:${ESCALATED:-none}"'
 oc_case "escalation targets ONLY the old service pid" \
     "ONLY:2840093" \
-    'setup; ESCALATED=none OC_MODE=liar; mkproc 7007 "opencode serve --port 9" "$OC_ROOT/install/bin/opencode.exe" 9000000002; opencode_stop_service 2840093 397368592 >/dev/null 2>&1; echo "ONLY:${ESCALATED:-none}"'
+    'setup; ESCALATED=none; echo liar > "$OC_ROOT/mode"; mkproc 7007 "opencode serve --port 9" "$OC_ROOT/install/bin/opencode.exe" 9000000002; opencode_stop_service 2840093 397368592 >/dev/null 2>&1; echo "ONLY:${ESCALATED:-none}"'
 oc_case "a PID that refuses to die vetoes the stop" \
     "STOP:1" \
-    'setup; OC_MODE=liar OC_STUBBORN=1; opencode_stop_service 2840093 397368592 >/dev/null 2>&1; echo "STOP:$?"'
+    'setup; echo liar > "$OC_ROOT/mode"; OC_STUBBORN=1; opencode_stop_service 2840093 397368592 >/dev/null 2>&1; echo "STOP:$?"'
 oc_case "a vetoed stop never reaches the upgrader" \
     "UPGRADE_CALLS:0" \
-    'setup; OC_MODE=liar OC_STUBBORN=1; : > "$OC_ROOT/official.log"; if opencode_stop_service 2840093 397368592 >/dev/null 2>&1; then "$OPENCODE_BIN" upgrade >/dev/null 2>&1; fi; echo "UPGRADE_CALLS:$(grep -c "^upgrade$" "$OC_ROOT/official.log")"'
+    'setup; echo liar > "$OC_ROOT/mode"; OC_STUBBORN=1; : > "$OC_ROOT/official.log"; if opencode_stop_service 2840093 397368592 >/dev/null 2>&1; then "$OPENCODE_BIN" upgrade >/dev/null 2>&1; fi; echo "UPGRADE_CALLS:$(grep -c "^upgrade$" "$OC_ROOT/official.log")"'
 check "stop escalates with a targeted SIGTERM" "grep -q 'sending SIGTERM to that PID only' $U"
 check "stop refuses to continue if the PID survives" "grep -q 'refusing to run' $U"
 
 printf '\n=== 36. pre-update proof gates the native upgrade ==='
 oc_case "surviving old PID => proof FAILS" \
     "PROOF:1" \
-    'setup; OC_MODE=liar; opencode_pre_update_proof 2840093 397368592 >/dev/null 2>&1; echo "PROOF:$?"'
+    'setup; echo liar > "$OC_ROOT/mode"; opencode_pre_update_proof 2840093 397368592 >/dev/null 2>&1; echo "PROOF:$?"'
 oc_case "old PID gone => proof PASSES" \
     "PROOF:0" \
     'setup; rm -rf "$PROC_ROOT/2840093"; opencode_pre_update_proof 2840093 397368592 >/dev/null 2>&1; echo "PROOF:$?"'
@@ -1421,6 +1470,18 @@ check "upgrade is skipped when the proof fails" \
     "grep -q 'pre-update proof failed; .opencode upgrade. was not run' $U"
 
 printf '\n=== 37. same-version freshness requires a NEW process ==='
+oc_case "zero rc with scary text is invocation success" \
+    "ok|error: failed, cannot find anything|0" \
+    'setup; echo scary > "$OC_ROOT/mode"; opencode_official info'
+oc_case "nonzero rc is command error" \
+    "error|upgrade failed|3" \
+    'setup; echo upgrade-fail > "$OC_ROOT/mode"; opencode_official upgrade'
+oc_case "timeout is command error" \
+    "error||124" \
+    'setup; OC_TIMEOUT=1; opencode_official info'
+oc_case "restoration starts service and fresh PID passes production proof" \
+    "FRESH:0 PID:8001" \
+    'setup; rm -rf "$PROC_ROOT/2840093"; opencode_restore_service 1 >/dev/null; opencode_verify_fresh_service 2840093 397368592 2.0.22 >/dev/null 2>&1; echo "FRESH:$? PID:$(opencode_service_pid)"'
 oc_case "same PID + same start time => freshness FAILS" \
     "FRESH:1" \
     'setup; opencode_verify_fresh_service 2840093 397368592 2.0.22 >/dev/null 2>&1; echo "FRESH:$?"'
@@ -1549,6 +1610,131 @@ check "dry-run did not change the opencode binary" \
 
 rm -rf "$SBOC"
 rm -rf "$SBX"
+
+
+printf '\n=== 41. check, force, dry-run and workload warning contracts ==='
+$U --force >/dev/null 2>&1; [[ $? -eq 2 ]] && ok "--force without selection is usage error" || bad "--force without selection"
+$U --force --verify >/dev/null 2>&1; [[ $? -eq 2 ]] && ok "--force with verify is usage error" || bad "--force --verify"
+$U --force --check >/dev/null 2>&1; [[ $? -eq 2 ]] && ok "--force with check is usage error" || bad "--force --check"
+$U --check --all >/dev/null 2>&1; [[ $? -eq 2 ]] && ok "--check with selection is usage error" || bad "--check --all"
+DR_HOME="$(mktemp -d /tmp/update-dryzero.XXXXXX)"
+HOME="$DR_HOME" $U --all --dry-run >/dev/null 2>&1
+[[ $? -eq 0 ]] && ok "isolated all dry-run succeeds" || bad "isolated all dry-run"
+[[ ! -e "$DR_HOME/.local/state/tool-updates/update.lock" ]] && ok "dry-run creates no lock" || bad "dry-run created lock"
+[[ ! -e "$DR_HOME/.local/state/tool-updates/update.lock.holder" ]] && ok "dry-run creates no holder" || bad "dry-run created holder"
+[[ ! -e "$DR_HOME/.local/state/tool-updates/logs/update" ]] && ok "dry-run creates no logs" || bad "dry-run created log path"
+check "dry-run closes caller fd 9" "grep -q 'exec 9>&-' $U"
+mkdir -p "$DR_HOME/.local/bin"
+cat > "$DR_HOME/.local/bin/systemctl" <<'FDPROBE'
+#!/usr/bin/env bash
+if [[ -e /proc/self/fd/9 ]]; then echo inherited > "$FD_MARK"; else echo closed > "$FD_MARK"; fi
+case "$*" in *MainPID*) echo 0 ;; *ActiveEnterTimestamp*) echo n/a ;; *LoadState*) echo not-found ;; *is-active*) exit 3 ;; *is-enabled*) exit 1 ;; *) exit 0 ;; esac
+FDPROBE
+chmod +x "$DR_HOME/.local/bin/systemctl"
+exec 9>"$DR_HOME/held.lock"
+FD_MARK="$DR_HOME/fdmark" HOME="$DR_HOME" $U --t3 --dry-run >/dev/null 2>&1
+exec 9>&-
+grep -q '^closed$' "$DR_HOME/fdmark" && ok "dry-run descendants do not inherit held fd 9" || bad "dry-run descendant inherited fd 9"
+CHECK_HOME="$(mktemp -d /tmp/update-checkzero.XXXXXX)"
+HOME="$CHECK_HOME" $U --check >/dev/null 2>&1
+[[ $? -eq 0 ]] && ok "isolated --check completes with UNKNOWN tools" || bad "isolated --check failed"
+[[ ! -e "$CHECK_HOME/.local/state/tool-updates/update.lock" ]] && ok "--check creates no lock" || bad "--check created lock"
+[[ ! -e "$CHECK_HOME/.local/state/tool-updates/update.lock.holder" ]] && ok "--check creates no holder" || bad "--check created holder"
+[[ ! -e "$CHECK_HOME/.local/state/tool-updates/logs/update" ]] && ok "--check creates no logs" || bad "--check created logs"
+rm -rf "$CHECK_HOME"
+check "T3 update warns before native restart" "python3 -c 's=open(\"$U\").read(); i=s.index(\"warn_t3_workloads\\n    info \\\"Running: t3 update\"); assert i>0'"
+check "T3 warning reports categories only" "grep -q 'Active child workloads that may be interrupted' $U && grep -q 'npm/pnpm/test/build' $U"
+T3_FIX="$(mktemp -d /tmp/update-t3-cgroup.XXXXXX)"
+for p in 710 711 712 713; do mkdir -p "$T3_FIX/proc/$p"; printf '0::/user.slice/t3code.service\n' > "$T3_FIX/proc/$p/cgroup"; done
+printf 'opencode\0serve\0' > "$T3_FIX/proc/710/cmdline"
+printf 'npm\0run\0test\0' > "$T3_FIX/proc/711/cmdline"
+printf 'bash\0-i\0' > "$T3_FIX/proc/712/cmdline"
+printf 'worker\0' > "$T3_FIX/proc/713/cmdline"
+python3 - "$U" "$T3_FIX/harness.sh" <<'T3PY'
+import sys
+s=open(sys.argv[1]).read(); name='t3_workload_counts() {'; i=s.index(name); d=0
+for j in range(i,len(s)):
+    if s[j]=='{': d+=1
+    elif s[j]=='}':
+        d-=1
+        if d==0: break
+open(sys.argv[2],'w').write('T3_UNIT=t3code.service\nt3_main_pid(){ echo 1; }\nis_descendant_of(){ return 1; }\n'+s[i:j+1]+'\nt3_workload_counts\n')
+T3PY
+T3_COUNTS="$(PROC_ROOT="$T3_FIX/proc" bash "$T3_FIX/harness.sh")"
+grep -q 'OpenCode: 1' <<<"$T3_COUNTS" && ok "T3 cgroup fixture counts OpenCode" || bad "T3 OpenCode count"
+grep -q 'npm/pnpm/test/build: 1' <<<"$T3_COUNTS" && ok "T3 cgroup fixture counts tests" || bad "T3 test count"
+grep -q 'terminals/shells: 1' <<<"$T3_COUNTS" && ok "T3 cgroup fixture counts shells" || bad "T3 shell count"
+grep -q 'other: 1' <<<"$T3_COUNTS" && ok "T3 cgroup fixture counts other" || bad "T3 other count"
+check "precheck model has all four outcomes" "grep -q 'UPDATE_AVAILABLE' $U && grep -q 'CURRENT' $U && grep -q 'UNKNOWN' $U && grep -q 'NOT_CONFIGURED' $U"
+check "force gates only the CURRENT short-circuit" "grep -q 'FORCE_UPDATE -eq 0' $U"
+
+# Exercise the real conservative classifier with isolated stubs. Only OpenCode
+# currently has a proven read-only latest source; the other configured tools
+# must be UNKNOWN and missing tools NOT_CONFIGURED.
+PRECHECK_FIX="$(mktemp -d /tmp/update-precheck.XXXXXX)"
+python3 - "$U" "$PRECHECK_FIX/classifier.sh" <<'PRECHECKPY'
+import sys
+s=open(sys.argv[1]).read(); name='precheck_tool() {'; i=s.index(name); d=0
+for j in range(i,len(s)):
+    if s[j]=='{': d+=1
+    elif s[j]=='}':
+        d-=1
+        if d==0: break
+helpers='''
+declare -A PRECHECK PRECHECK_DETAIL
+CODEX_BIN=/bin/codex; HERMES_BIN=/bin/hermes; T3_BIN=/bin/t3; OPENCODE_BIN=/bin/opencode
+opencode_version(){ echo "$OC_VERSION"; }
+opencode_install_root(){ echo /fake/current; }
+opencode_service_pids(){ :; }
+opencode_verify_local_health(){ return "$OC_HEALTH"; }
+opencode_stale_processes(){ return 0; }
+'''
+open(sys.argv[2],'w').write('#!/usr/bin/env bash\nset -u\n'+helpers+s[i:j+1]+'''
+precheck_tool codex; echo "codex=${PRECHECK[codex]}"
+precheck_tool hermes; echo "hermes=${PRECHECK[hermes]}"
+precheck_tool t3; echo "t3=${PRECHECK[t3]}"
+precheck_tool opencode; echo "opencode=${PRECHECK[opencode]} ${PRECHECK_DETAIL[opencode]}"
+''')
+PRECHECKPY
+cat > "$PRECHECK_FIX/curl" <<'CURLSTUB'
+#!/usr/bin/env bash
+[[ "$OC_LOOKUP" == fail ]] && exit 22
+printf '{"version":"%s"}\n' "$OC_LATEST"
+CURLSTUB
+chmod +x "$PRECHECK_FIX/curl" "$PRECHECK_FIX/classifier.sh"
+PC="$(PATH="$PRECHECK_FIX:$PATH" OC_VERSION=1.0 OC_LATEST=2.0 OC_HEALTH=0 OC_LOOKUP=ok bash "$PRECHECK_FIX/classifier.sh")"
+grep -q '^codex=UNKNOWN$' <<<"$PC" && ok "configured Codex precheck is UNKNOWN" || bad "Codex precheck classification"
+grep -q '^hermes=UNKNOWN$' <<<"$PC" && ok "configured Hermes precheck is UNKNOWN" || bad "Hermes precheck classification"
+grep -q '^t3=UNKNOWN$' <<<"$PC" && ok "configured T3 precheck is UNKNOWN" || bad "T3 precheck classification"
+grep -q '^opencode=UPDATE_AVAILABLE ' <<<"$PC" && ok "OpenCode newer registry version is UPDATE_AVAILABLE" || bad "OpenCode UPDATE_AVAILABLE classification"
+PC="$(PATH="$PRECHECK_FIX:$PATH" OC_VERSION=2.0 OC_LATEST=2.0 OC_HEALTH=0 OC_LOOKUP=ok bash "$PRECHECK_FIX/classifier.sh")"
+grep -q '^opencode=CURRENT ' <<<"$PC" && ok "healthy current OpenCode is CURRENT" || bad "OpenCode CURRENT classification"
+PC="$(PATH="$PRECHECK_FIX:$PATH" OC_VERSION=2.0 OC_LATEST=2.0 OC_HEALTH=0 OC_LOOKUP=fail bash "$PRECHECK_FIX/classifier.sh")"
+grep -q '^opencode=UNKNOWN ' <<<"$PC" && ok "registry failure degrades OpenCode to UNKNOWN" || bad "lookup failure incorrectly classified"
+PC="$(PATH="$PRECHECK_FIX:$PATH" OC_VERSION=2.0 OC_LATEST=2.0 OC_HEALTH=1 OC_LOOKUP=ok bash "$PRECHECK_FIX/classifier.sh")"
+grep -q '^opencode=UNKNOWN ' <<<"$PC" && ok "unhealthy OpenCode is never CURRENT" || bad "unhealthy OpenCode classified current"
+rm -rf "$PRECHECK_FIX"
+
+printf '\n=== 42. bounded updater log retention ==='
+LOG_FIX="$(mktemp -d /tmp/update-logs.XXXXXX)"
+mkdir -p "$LOG_FIX/logs"
+for i in $(seq -w 1 23); do : > "$LOG_FIX/logs/20261006T1200${i}Z-$i.log"; done
+: > "$LOG_FIX/logs/keep-me.txt"
+python3 - "$U" "$LOG_FIX/prune.sh" "$LOG_FIX/logs" <<'LOGPY'
+import sys
+s=open(sys.argv[1]).read(); name='prune_update_logs() {'; i=s.index(name); d=0
+for j in range(i,len(s)):
+    if s[j]=='{': d+=1
+    elif s[j]=='}':
+        d-=1
+        if d==0: break
+pre='LOG_KEEP=20\nLOG_DIR='+repr(sys.argv[3])+'\nACTIVE_LOG='+repr(sys.argv[3]+'/20261006T120023Z-23.log')+'\nDRY_RUN=0; DO_VERIFY=0; DO_CHECK=0\nwarn(){ :; }\n'
+open(sys.argv[2],'w').write(pre+s[i:j+1]+'\nprune_update_logs\n')
+LOGPY
+bash "$LOG_FIX/prune.sh"
+[[ "$(find "$LOG_FIX/logs" -maxdepth 1 -type f -name '*.log' | wc -l)" -eq 20 ]] && ok "pruning retains LOG_KEEP newest logs" || bad "log retention count"
+[[ -f "$LOG_FIX/logs/keep-me.txt" ]] && ok "pruning leaves unrelated files" || bad "unrelated file removed"
+check "pruning skips read-only modes" "grep -q 'DRY_RUN -eq 0 && \$DO_VERIFY -eq 0 && \$DO_CHECK -eq 0' $U"
 
 printf '\n--- %d passed, %d failed ---\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

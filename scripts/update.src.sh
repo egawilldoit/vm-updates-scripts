@@ -28,7 +28,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_NAME="update"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 
 # --- Identity / environment ----------------------------------------------------
 export HOME="${HOME:-/home/ubuntu}"
@@ -50,6 +50,8 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNT
 readonly STATE_ROOT="$HOME/.local/state/tool-updates"
 readonly GLOBAL_LOCK="$STATE_ROOT/update.lock"
 readonly LOG_DIR="$STATE_ROOT/logs/update"
+readonly LOG_KEEP=20
+ACTIVE_LOG=""
 
 # --- Tool locations (discovered, not assumed) ---------------------------------
 CODEX_BIN="$(command -v codex 2>/dev/null || true)"
@@ -82,7 +84,10 @@ DO_OPENCODE=0
 DO_HERMES=0
 DO_T3=0
 DO_VERIFY=0
+DO_CHECK=0
+FORCE_UPDATE=0
 DRY_RUN=0
+declare -A PRECHECK=() PRECHECK_DETAIL=()
 
 # --- Result tracking ----------------------------------------------------------
 declare -A RESULT=()          # component -> PASS|FAIL|SKIPPED|DISABLED|NOT_CONFIGURED
@@ -94,6 +99,8 @@ UPDATE_FAILURES=0
 T3_STOPPED_BY_US=0
 IN_MUTATION=0
 LOG_FH_OPEN=0
+LOCK_HELD=0
+OBS_LOCK_BUSY=0
 RESTART_T3_REASON=""
 DAEMON_PKG_STATUS=""
 DAEMON_PKG_DETAIL=""
@@ -208,6 +215,8 @@ Usage:
   update --hermes [--dry-run]
   update --t3 [--dry-run]
   update --verify
+  update --check
+  update --force --all
 
 Options:
   --codex       Update Codex
@@ -216,6 +225,8 @@ Options:
   --t3          Update T3 nightly
   --all         Update Codex, OpenCode V2, Hermes, and T3
   --verify      Read-only stack verification
+  --check       Read-only update availability report
+  --force       Run native updater even when proven current
   --dry-run     Show exactly what would happen without changing anything
   -h, --help    Show help
 
@@ -421,6 +432,37 @@ t3_pending_update() { # echoes pending|failed|none
         [[ -e "$f" ]] && { echo "failed"; return 0; }
     done
     echo "none"
+}
+
+# Count likely interruptible work inside t3code.service without exposing argv.
+# Membership comes from cgroup data or ancestry under MainPID; no process is signalled.
+t3_workload_counts() {
+    local root="${PROC_ROOT:-/proc}" pid main cg cmd cmd0 op=0 build=0 shells=0 other=0
+    main="$(t3_main_pid)"
+    for p in "$root"/[0-9]*; do
+        [[ -d "$p" ]] || continue
+        pid="${p##*/}"
+        cg="$(sed -n 's#^[0-9]*::##p' "$p/cgroup" 2>/dev/null | head -n1 || true)"
+        if [[ "$cg" != *"$T3_UNIT"* ]] && ! { [[ "$main" =~ ^[0-9]+$ && "$main" != 0 ]] && is_descendant_of "$pid" "$main"; }; then
+            continue
+        fi
+        cmd="$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null || true)"
+        cmd0="${cmd%% *}"; cmd0="${cmd0##*/}"
+        case "$cmd" in
+            *opencode*) op=$((op+1)) ;;
+            *)
+                case "$cmd0" in npm|pnpm|yarn|node|vite|webpack) build=$((build+1)) ;;
+                    bash|sh|zsh|fish|terminal) shells=$((shells+1)) ;;
+                    *) case "$cmd" in *test*|*build*) build=$((build+1)) ;; *) other=$((other+1)) ;; esac ;;
+                esac ;;
+        esac
+    done
+    printf 'OpenCode: %d\nnpm/pnpm/test/build: %d\nterminals/shells: %d\nother: %d\n' "$op" "$build" "$shells" "$other"
+}
+
+warn_t3_workloads() {
+    printf 'T3 update will restart t3code.service. Active child workloads that may be interrupted:\n'
+    t3_workload_counts | sed 's/^/  /'
 }
 
 t3_http_health() {
@@ -1240,11 +1282,11 @@ opencode_stop_service() { # <old_pid> <old_start>
 opencode_official() { # <subcommand> [args...]
     local sub="$1"; shift
     local out rc
-    out="$(timeout 120 "$OPENCODE_BIN" "$@" 2>&1)" && rc=0 || rc=$?
+    # Close the mutation lock before the command is spawned. In particular,
+    # `service start` may detach a daemon which must not prolong our lock.
+    out="$(timeout 120 "$OPENCODE_BIN" "$sub" "$@" 9>&- 2>&1)" && rc=0 || rc=$?
     local status="ok"
-    if printf '%s' "$out" | grep -qiE 'error|failed|cannot|not found'; then
-        status="error"
-    fi
+    [[ $rc -eq 0 ]] || status="error"
     printf '%s|%s|%s' "$status" "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)" "$rc"
 }
 
@@ -1449,11 +1491,25 @@ acquire_lock() {
         err "No changes were made. Wait for it to finish, then retry."
         exit 3
     fi
+    LOCK_HELD=1
     # Identify the holder for humans. Written to a sidecar, never to the lock
     # file itself, so we cannot truncate another updater's record.
     printf 'pid=%s\nstarted=%s\ncmd=%s\n' \
         "$$" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${UPDATE_ARGV:-<unknown>}" \
         > "$STATE_ROOT/update.lock.holder" 2>/dev/null || true
+    return 0
+}
+
+# Dry-run and --check never create a lock file or holder record. If one already
+# exists, make a best-effort read-only shared-lock observation in a short-lived
+# subshell. A concurrent mutation may start immediately afterwards, so this
+# remains an observational snapshot rather than a transaction.
+acquire_observation_lock() {
+    [[ -e "$GLOBAL_LOCK" ]] || return 0
+    if ! ( exec 8<"$GLOBAL_LOCK" && flock -s -n 8 ); then
+        OBS_LOCK_BUSY=1
+        warn "mutation lock is busy; continuing with an observational snapshot that may become stale"
+    fi
     return 0
 }
 
@@ -1467,7 +1523,9 @@ on_exit() {
         printf '=== update finished rc=%s at %s ===\n' \
             "$rc" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     fi
-    rm -f "$STATE_ROOT/update.lock.holder" 2>/dev/null || true
+    if [[ $LOCK_HELD -eq 1 ]]; then
+        rm -f "$STATE_ROOT/update.lock.holder" 2>/dev/null || true
+    fi
     exit "$rc"
 }
 
@@ -1533,15 +1591,105 @@ start_logging() {
     #                                       -> log
     exec > >(scrub | tee -a "$logf") 2>&1
     LOG_FH_OPEN=1
+    ACTIVE_LOG="$logf"
 
     printf '=== update run %s pid=%s log=%s ===\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$$" "$logf"
     return 0
 }
 
+prune_update_logs() {
+    [[ $DRY_RUN -eq 0 && $DO_VERIFY -eq 0 && $DO_CHECK -eq 0 ]] || return 0
+    [[ -d "$LOG_DIR" && ! -L "$LOG_DIR" ]] || return 0
+    local rows=() i name path
+    mapfile -t rows < <(find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f -name '*.log' -printf '%T@ %f\n' 2>/dev/null | sort -rn)
+    for ((i=LOG_KEEP; i<${#rows[@]}; i++)); do
+        name="${rows[$i]#* }"
+        [[ "$name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+\.log$ ]] || continue
+        path="$LOG_DIR/$name"
+        [[ "$path" == "$ACTIVE_LOG" ]] && continue
+        if ! rm -- "$path" 2>/dev/null; then warn "could not prune old updater log: $name"; fi
+    done
+}
+
 # =============================================================================
 # VERIFY — read-only, zero mutation
 # =============================================================================
+
+# Availability is deliberately conservative: only OpenCode has a bounded,
+# read-only lookup against the npm registry channel used by its native upgrade.
+precheck_tool() { # precheck_tool <codex|opencode|hermes|t3>
+    local tool="$1" installed latest root pid exe
+    [[ -n "${PRECHECK[$tool]:-}" ]] && return 0
+    case "$tool" in
+        codex) [[ -z "$CODEX_BIN" ]] && { PRECHECK[$tool]=NOT_CONFIGURED; PRECHECK_DETAIL[$tool]="not installed"; return; }
+            PRECHECK[$tool]=UNKNOWN; PRECHECK_DETAIL[$tool]="no safe read-only authoritative latest check; native reconciliation required" ;;
+        hermes) [[ -z "$HERMES_BIN" ]] && { PRECHECK[$tool]=NOT_CONFIGURED; PRECHECK_DETAIL[$tool]="not installed"; return; }
+            PRECHECK[$tool]=UNKNOWN; PRECHECK_DETAIL[$tool]="native check may mutate checkout metadata; latest ref unavailable safely" ;;
+        t3) [[ -z "$T3_BIN" ]] && { PRECHECK[$tool]=NOT_CONFIGURED; PRECHECK_DETAIL[$tool]="not installed"; return; }
+            PRECHECK[$tool]=UNKNOWN; PRECHECK_DETAIL[$tool]="nightly latest ref unavailable safely; reconciliation required" ;;
+        opencode)
+            [[ -z "$OPENCODE_BIN" ]] && { PRECHECK[$tool]=NOT_CONFIGURED; PRECHECK_DETAIL[$tool]="not installed"; return; }
+            installed="$(opencode_version)"
+            if [[ -z "$installed" ]]; then PRECHECK[$tool]=UNKNOWN; PRECHECK_DETAIL[$tool]="installed version unreadable"; return; fi
+            latest="$(timeout 8 curl -fsS --max-time 7 'https://registry.npmjs.org/%40opencode%2Fcli/latest' 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)"
+            if [[ -z "$latest" ]]; then PRECHECK[$tool]=UNKNOWN; PRECHECK_DETAIL[$tool]="npm registry latest lookup unavailable; installed v$installed"; return; fi
+            root="$(opencode_install_root 2>/dev/null || true)"
+            while read -r pid; do
+                [[ -n "$pid" ]] || continue
+                exe="$(proc_exe "$pid")"
+                if [[ -z "$root" || "$exe" != "$root"/* ]]; then
+                    PRECHECK[$tool]=UNKNOWN; PRECHECK_DETAIL[$tool]="running service PID $pid is outside the current installation"; return
+                fi
+            done < <(opencode_service_pids)
+            if [[ "$installed" != "$latest" ]]; then
+                PRECHECK[$tool]=UPDATE_AVAILABLE; PRECHECK_DETAIL[$tool]="v$installed -> v$latest"
+            elif opencode_verify_local_health; then
+                PRECHECK[$tool]=CURRENT; PRECHECK_DETAIL[$tool]="v$installed; local verification healthy"
+            else
+                PRECHECK[$tool]=UNKNOWN; PRECHECK_DETAIL[$tool]="v$installed; local service verification is not healthy"
+            fi
+            ;;
+    esac
+}
+
+opencode_verify_local_health() {
+    local stale
+    stale="$(opencode_stale_processes)"
+    [[ -z "$stale" ]]
+}
+
+precheck_selected() {
+    [[ $DO_CODEX -eq 1 ]] && precheck_tool codex
+    [[ $DO_OPENCODE -eq 1 ]] && precheck_tool opencode
+    [[ $DO_HERMES -eq 1 ]] && precheck_tool hermes
+    [[ $DO_T3 -eq 1 ]] && precheck_tool t3
+    if [[ $OBS_LOCK_BUSY -eq 1 ]]; then
+        local t
+        for t in codex opencode hermes t3; do
+            [[ -n "${PRECHECK[$t]:-}" && "${PRECHECK[$t]}" == CURRENT ]] || continue
+            PRECHECK[$t]=UNKNOWN
+            PRECHECK_DETAIL[$t]="mutation lock is busy; current state cannot be accepted"
+        done
+    fi
+}
+
+print_check() {
+    local t s d rc=0
+    printf 'UPDATE AVAILABILITY\n'
+    for t in codex opencode hermes t3; do
+        precheck_tool "$t"
+        if [[ $OBS_LOCK_BUSY -eq 1 && "${PRECHECK[$t]}" == CURRENT ]]; then
+            PRECHECK[$t]=UNKNOWN
+            PRECHECK_DETAIL[$t]="mutation lock is busy; current state cannot be accepted"
+        fi
+        s="${PRECHECK[$t]}"; d="${PRECHECK_DETAIL[$t]}"
+        printf '%-10s %-18s %s\n' "$t" "$s" "$d"
+        [[ "$s" == UNKNOWN ]] && continue
+        [[ "$s" == NOT_CONFIGURED ]] && continue
+    done
+    return "$rc"
+}
 
 # Surface the daemon-package outcome in the final result so an "unsupported"
 # or "skipped" step can never be mistaken for a completed update.
@@ -1775,6 +1923,14 @@ do_verify() {
 
 do_codex_update() {
     section "CODEX"
+    if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
+        precheck_tool codex
+        if [[ "${PRECHECK[codex]}" == CURRENT ]]; then
+            record codex PASS "already current: ${PRECHECK_DETAIL[codex]}"
+            status_line codex PASS "already current: ${PRECHECK_DETAIL[codex]}"
+            return 0
+        fi
+    fi
     if [[ -z "$CODEX_BIN" ]]; then
         record codex SKIPPED "codex not installed on PATH"
         status_line codex SKIPPED "not installed on PATH"
@@ -2132,6 +2288,14 @@ codex_verify_after_failure() {
 
 do_opencode_update() {
     section "OPENCODE V2"
+    if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
+        precheck_tool opencode
+        if [[ "${PRECHECK[opencode]}" == CURRENT ]]; then
+            record opencode PASS "already current: ${PRECHECK_DETAIL[opencode]}"
+            status_line opencode PASS "already current: ${PRECHECK_DETAIL[opencode]}"
+            return 0
+        fi
+    fi
     if [[ -z "$OPENCODE_BIN" ]]; then
         record opencode SKIPPED "opencode not installed on PATH"
         status_line opencode SKIPPED "not installed on PATH"
@@ -2272,7 +2436,7 @@ do_opencode_update() {
     IN_MUTATION=1
     local rc=0
     info "Running: opencode upgrade"
-    if ! "$OPENCODE_BIN" upgrade 2>&1 | sed 's/^/    /'; then
+    if ! "$OPENCODE_BIN" upgrade 9>&- 2>&1 | sed 's/^/    /'; then
         rc=1
     fi
     UPDATE_RC[opencode]=$rc
@@ -2318,6 +2482,14 @@ do_opencode_update() {
 
 do_hermes_update() {
     section "HERMES"
+    if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
+        precheck_tool hermes
+        if [[ "${PRECHECK[hermes]}" == CURRENT ]]; then
+            record hermes PASS "already current: ${PRECHECK_DETAIL[hermes]}"
+            status_line hermes PASS "already current: ${PRECHECK_DETAIL[hermes]}"
+            return 0
+        fi
+    fi
     if [[ -z "$HERMES_BIN" ]]; then
         record hermes SKIPPED "hermes not installed on PATH"
         status_line hermes SKIPPED "not installed on PATH"
@@ -2356,7 +2528,7 @@ do_hermes_update() {
     IN_MUTATION=1
     local rc=0
     info "Running: hermes update --yes --no-backup   (--no-backup: no custom state backup)"
-    if ! "$HERMES_BIN" update --yes --no-backup 2>&1 | sed 's/^/    /'; then
+    if ! "$HERMES_BIN" update --yes --no-backup 9>&- 2>&1 | sed 's/^/    /'; then
         rc=1
     fi
     UPDATE_RC[hermes]=$rc
@@ -2431,8 +2603,9 @@ do_t3_update() {
 
     IN_MUTATION=1
     local rc=0
+    warn_t3_workloads
     info "Running: t3 update --channel nightly --yes"
-    if ! "$T3_BIN" update --channel nightly --yes 2>&1 | sed 's/^/    /'; then
+    if ! "$T3_BIN" update --channel nightly --yes 9>&- 2>&1 | sed 's/^/    /'; then
         rc=1
     fi
     UPDATE_RC[t3]=$rc
@@ -2732,6 +2905,8 @@ parse_args() {
             --t3)      DO_T3=1 ;;
             --all)     DO_CODEX=1; DO_OPENCODE=1; DO_HERMES=1; DO_T3=1 ;;
             --verify)  DO_VERIFY=1 ;;
+            --check)   DO_CHECK=1 ;;
+            --force)   FORCE_UPDATE=1 ;;
             --dry-run) DRY_RUN=1 ;;
             -h|--help) usage; exit 0 ;;
             *)
@@ -2743,7 +2918,7 @@ parse_args() {
     done
 
     if [[ $DO_VERIFY -eq 1 ]]; then
-        if [[ $DO_CODEX -eq 1 || $DO_OPENCODE -eq 1 || $DO_HERMES -eq 1 || $DO_T3 -eq 1 ]]; then
+        if [[ $DO_CODEX -eq 1 || $DO_OPENCODE -eq 1 || $DO_HERMES -eq 1 || $DO_T3 -eq 1 || $FORCE_UPDATE -eq 1 || $DO_CHECK -eq 1 ]]; then
             printf 'ERROR: --verify cannot be combined with an update flag.\n' >&2
             printf '       Use "update --verify" alone, or "update --all".\n' >&2
             exit 2
@@ -2753,6 +2928,17 @@ parse_args() {
             exit 2
         fi
         return 0
+    fi
+
+    if [[ $DO_CHECK -eq 1 ]]; then
+        if [[ $DO_CODEX -eq 1 || $DO_OPENCODE -eq 1 || $DO_HERMES -eq 1 || $DO_T3 -eq 1 || $DO_VERIFY -eq 1 || $DRY_RUN -eq 1 || $FORCE_UPDATE -eq 1 ]]; then
+            printf 'ERROR: --check must be used alone.\n' >&2; exit 2
+        fi
+        return 0
+    fi
+
+    if [[ $FORCE_UPDATE -eq 1 && $DO_CODEX -eq 0 && $DO_OPENCODE -eq 0 && $DO_HERMES -eq 0 && $DO_T3 -eq 0 ]]; then
+        printf 'ERROR: --force requires an update selection.\n' >&2; exit 2
     fi
 
     if [[ $DO_CODEX -eq 0 && $DO_OPENCODE -eq 0 && $DO_HERMES -eq 0 && $DO_T3 -eq 0 ]]; then
@@ -2769,13 +2955,53 @@ parse_args() {
 main() {
     parse_args "$@"
 
+    # Read-only invocations must not preserve a caller's mutation-lock fd.
+    if [[ $DO_VERIFY -eq 1 || $DRY_RUN -eq 1 ]]; then
+        exec 9>&-
+    fi
+
     if [[ $DO_VERIFY -eq 1 ]]; then
         do_verify || exit 1
         exit 0
     fi
 
+    if [[ $DO_CHECK -eq 1 ]]; then
+        exec 9>&-
+        acquire_observation_lock
+        print_check
+        exit 0
+    fi
+
+    if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
+        acquire_observation_lock
+        precheck_selected
+        local all_current=1 t
+        for t in codex opencode hermes t3; do
+            case "$t" in
+                codex) [[ $DO_CODEX -eq 1 ]] || continue ;;
+                opencode) [[ $DO_OPENCODE -eq 1 ]] || continue ;;
+                hermes) [[ $DO_HERMES -eq 1 ]] || continue ;;
+                t3) [[ $DO_T3 -eq 1 ]] || continue ;;
+            esac
+            [[ "${PRECHECK[$t]}" == CURRENT ]] || all_current=0
+        done
+        if [[ $all_current -eq 1 ]]; then
+            for t in codex opencode hermes t3; do
+                [[ -n "${PRECHECK[$t]:-}" ]] || continue
+                record "$t" PASS "already current: ${PRECHECK_DETAIL[$t]}"
+                status_line "$t" PASS "already current: ${PRECHECK_DETAIL[$t]}"
+            done
+            printf 'No native updater was needed; all selected tools are proven current.\n'
+            exit 0
+        fi
+    fi
+
     UPDATE_ARGV="$*"
-    acquire_lock
+    if [[ $DRY_RUN -eq 1 ]]; then
+        acquire_observation_lock
+    else
+        acquire_lock
+    fi
     install_traps
     start_logging
 
@@ -2794,7 +3020,11 @@ main() {
     [[ $DO_HERMES -eq 1   ]] && selected+=("hermes")
     [[ $DO_T3 -eq 1       ]] && selected+=("t3")
     info "selected: ${selected[*]}"
-    info "lock: $GLOBAL_LOCK (held)"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        info "lock: observational only; snapshot may become stale if an updater starts concurrently"
+    else
+        info "lock: $GLOBAL_LOCK (held exclusively)"
+    fi
 
     # Order is fixed and independent of argv: T3 runs LAST, because the Codex
     # and OpenCode workflows may need to stop T3 to release provider children.
@@ -2811,13 +3041,13 @@ main() {
         [[ $DO_T3 -eq 1 ]] && a_clean "obsolete T3 runtimes (keep active + one previous)"
         [[ $DO_CODEX -eq 1 ]] && a_clean "unused Codex releases (keep current + one previous)"
         info "no files were removed"
-    elif [[ $DO_T3 -eq 1 && "${RESULT[t3]:-}" == "PASS" ]]; then
+    elif [[ $DO_T3 -eq 1 && "${RESULT[t3]:-}" == "PASS" && "${UPDATE_RC[t3]:-}" == "0" ]]; then
         cleanup_t3_runtimes
     else
         info "skipped T3 runtime cleanup: T3 was not selected, or its update did not verify"
     fi
     if [[ $DRY_RUN -eq 0 ]]; then
-        if [[ $DO_CODEX -eq 1 && "${RESULT[codex]:-}" == "PASS" ]]; then
+        if [[ $DO_CODEX -eq 1 && "${RESULT[codex]:-}" == "PASS" && "${UPDATE_RC[codex]:-}" == "0" ]]; then
             cleanup_codex_releases
         else
             info "skipped Codex release cleanup: Codex was not selected, or its update did not verify"
@@ -2834,6 +3064,8 @@ main() {
         verify_hermes
         verify_t3
     fi
+
+    prune_update_logs
 
     print_summary || exit 1
     exit 0
