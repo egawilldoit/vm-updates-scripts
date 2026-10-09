@@ -148,8 +148,16 @@ check "no exec 3 in executable code" \
     "! grep -vE '^[[:space:]]*#' $U | grep -q 'exec 3'"
 check "scrub runs before tee" \
     "sed -n '/^start_logging()/,/^}/p' $U | grep -q 'scrub | tee'"
+check "logger preserves logs if terminal consumer closes" \
+    "sed -n '/^start_logging()/,/^}/p' $U | grep -q 'tee -p -a'"
+check "logger remains alive to record interruption status" \
+    "sed -n '/^start_logging()/,/^}/p' $U | grep -q \"trap '' INT TERM\""
 check "start_logging pipes stderr too" \
     "sed -n '/^start_logging()/,/^}/p' $U | grep -q '2>&1'"
+check "global redactor flushes each line" \
+    "grep -q 'scrub() { sed -u ' $U"
+check "native updater indentation flushes each line" \
+    "grep -q \"sed -u 's/\^/    /'\" $U"
 
 # Exercise the real function in isolation against a temp log, proving the
 # pipeline works and that the log is redacted BEFORE it is written.
@@ -198,6 +206,9 @@ check "EXIT-trap style line reached the log" "grep -q 'update finished rc=0' $PL
 check "stdout still reached the terminal" "grep -q 'plain line survives' $T"
 check "no shell error on stderr" "! grep -qE 'Bad file descriptor|Broken pipe' $SB/terminal.err"
 check "stderr also went to the log" "grep -q 'stderr line' $PL"
+check "raw secret absent from terminal" "! grep -q 'SUPERSECRET12345' $T"
+check "raw token absent from terminal" "! grep -q 'abcdefSECRET' $T"
+check "redaction marker present in terminal" "grep -q '<REDACTED>' $T"
 # The ordering flaw: the log must NOT contain the raw secret.
 if grep -q 'SUPERSECRET12345' "$PL" 2>/dev/null; then
     bad "RAW SECRET IN LOG — scrub runs after tee"
@@ -206,6 +217,40 @@ check "redaction marker present in log" "grep -q '<REDACTED>' $PL"
 if grep -q 'abcdefSECRET' "$PL" 2>/dev/null; then
     bad "RAW TOKEN IN LOG"
 else ok "raw token absent from log"; fi
+
+# Verify incremental visibility through the actual logger and native sed stage.
+cat >"$SB/fake-updater" <<'FAKEUPDATER'
+#!/usr/bin/env bash
+printf 'first line\n'
+sleep 1
+printf 'second line\n'
+FAKEUPDATER
+chmod +x "$SB/fake-updater"
+(
+    exec > >(sed -u -E 's/((token|secret|password|api[_-]?key|authorization)[=: ]+)[^ ]+/\\1<REDACTED>/Ig' | tee -p -a "$SB/logs/stream.log") 2>&1
+    "$SB/fake-updater"
+) >"$SB/stream.terminal" 2>&1 &
+STREAM_PID=$!
+sleep 0.2
+grep -q 'first line' "$SB/stream.terminal" \
+    && ok "global logging pipeline displays first line before fake updater exits" \
+    || bad "global logging pipeline buffered first line"
+wait "$STREAM_PID"
+( "$SB/fake-updater" | sed -u 's/^/    /' ) >"$SB/native-stream.out" &
+NATIVE_PID=$!
+sleep 0.2
+grep -q 'first line' "$SB/native-stream.out" \
+    && ok "native updater indentation displays first line promptly" \
+    || bad "native updater indentation buffered first line"
+wait "$NATIVE_PID"
+
+# A closed terminal consumer must not break the shell's writes or lose log data.
+( "$SB/probe.sh" "$SB/logs/broken-consumer.log" ) > >(head -n0)
+BRC=$?
+[[ $BRC -eq 0 ]] && ok "broken terminal consumer does not fail updater output" \
+    || bad "broken terminal consumer exit $BRC"
+check "broken terminal consumer still leaves redacted log" \
+    "grep -q 'plain line survives' $SB/logs/broken-consumer.log && ! grep -q 'SUPERSECRET12345' $SB/logs/broken-consumer.log"
 rm -rf "$SB"
 
 printf '\n=== 16. daemon semantics (regression: ambiguous stop / exit-0-but-unsupported) ===\n'
@@ -1098,7 +1143,6 @@ N_APP=""
 if [[ -n "$_SOCK" ]]; then
     N_APP="$(ss -xlpn 2>/dev/null | grep -F -- "$_SOCK" | grep -o 'pid=[0-9]\+' | head -1 | cut -d= -f2)"
 fi
-N_LOOP="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$HOME/.codex/app-server-daemon/daemon-updater.pid" 2>/dev/null | head -1)"
 PF="$HOME/.codex/app-server-daemon/daemon.pid"
 [[ -e "$PF" ]] && PFB=1 || PFB=0
 [[ -e "$HOME/.codex/app-server-daemon/app-server.pid" ]] && PFB2=1 || PFB2=0
@@ -1828,6 +1872,97 @@ exec 8>&-
 [[ $CONTEND_RC -eq 3 ]] && ok "owned mutation lock exits 3 before precheck" || bad "contended update exit $CONTEND_RC"
 [[ ! -e "$CONTEND_HOME/trace" ]] && ok "contended updater never accepts CURRENT" || bad "contended updater reached precheck"
 [[ ! -e "$CONTEND_HOME/.local/state/tool-updates/update.lock.holder" ]] && ok "contended updater creates no holder" || bad "contended updater left holder"
+
+printf '\n=== 44. interruption recovery, timeout reporting, and concise status ===\n'
+check "signal handler protects against repeated Ctrl+C" \
+    "sed -n '/^on_signal()/,/^install_traps()/p' $U | grep -q \"trap '' INT TERM\""
+check "OpenCode stop is marked for interrupt recovery" \
+    "grep -q 'OPENCODE_STOP_IN_PROGRESS=1' $U && grep -q 'OPENCODE_RESTORE_NEEDED=1' $U"
+check "OpenCode interrupt recovery calls its official restore path" \
+    "sed -n '/^on_signal()/,/^install_traps()/p' $U | grep -q 'opencode_restore_service 1'"
+check "all native updates are bounded" \
+    "[[ \$(grep -c 'timeout --kill-after=30s 900' $U) -eq 4 ]]"
+check "timeout result is distinct from ordinary command failure" \
+    "grep -q 'timed out after %ss' $U && grep -q 'failed (rc=%s)' $U"
+NATIVE_REASON_TMP="$(mktemp /tmp/update-native-reason.XXXXXX)"
+sed -n '/^native_failure_reason()/,/^}/p' "$U" >"$NATIVE_REASON_TMP"
+eval "$(cat "$NATIVE_REASON_TMP")"
+TIMEOUT_REASON="$(native_failure_reason 'fake updater' 2 124)"
+FAILURE_REASON="$(native_failure_reason 'fake updater' 2 1)"
+[[ "$TIMEOUT_REASON" == *"timed out after 2s"* ]] \
+    && ok "timeout status is reported as a timeout" \
+    || bad "timeout status mapping: $TIMEOUT_REASON"
+[[ "$FAILURE_REASON" == *"failed (rc=1)"* ]] \
+    && ok "ordinary nonzero status is reported as failure" \
+    || bad "failure status mapping: $FAILURE_REASON"
+rm -f "$NATIVE_REASON_TMP"
+check "component status includes elapsed time" \
+    "grep -q 'elapsed:.*s' $U"
+check "version header prints one v prefix" \
+    "grep -q 'SCRIPT_NAME.*SCRIPT_VERSION' $U && ! grep -q ' %s v%s' $U"
+
+# Exercise the actual signal and EXIT handlers with a fake updater and an
+# OpenCode service stopped by this fixture. The harness owns a sandbox lock.
+INT_FIX="$(mktemp -d /tmp/update-interrupt.XXXXXX)"
+python3 - "$U" "$INT_FIX/harness.sh" <<'INTPY'
+import sys
+s=open(sys.argv[1]).read()
+def extract(name):
+    i=s.index(name); depth=0
+    for j in range(s.index('{',i),len(s)):
+        if s[j]=='{': depth+=1
+        elif s[j]=='}':
+            depth-=1
+            if depth==0: return s[i:j+1]
+    raise SystemExit('could not extract '+name)
+names=['scrub() {','acquire_lock() {','start_logging() {','on_exit() {','on_signal() {']
+pre='''#!/usr/bin/env bash
+set -Eeuo pipefail
+HOME="${1:?}"
+STATE_ROOT="$HOME/state"; GLOBAL_LOCK="$STATE_ROOT/update.lock"; LOG_DIR="$HOME/logs"
+LOCK_HELD=0; LOG_FH_OPEN=0; ACTIVE_LOG=""; DRY_RUN=0; IN_MUTATION=1
+UPDATE_ARGV="fake updater"; OBS_LOCK_BUSY=0; CODEX_RESTORE_NEEDED=0; T3_STOPPED_BY_US=0
+T3_UNIT=t3code.service; OPENCODE_SERVICE_WAS_RUNNING=1; OPENCODE_RESTORE_NEEDED=1; OPENCODE_STOP_IN_PROGRESS=0
+declare -a RESTORE_FAILURES=()
+C_RESET=""; C_BOLD=""; C_RED=""; C_YEL=""; C_CYN=""; C_GRN=""; C_DIM=""
+err(){ printf '%s\\n' "$*" >&2; }
+opencode_service_pid(){ [[ -e "$HOME/opencode.running" ]] && printf '9876\\n'; }
+opencode_restore_service(){ touch "$HOME/opencode.running"; touch "$HOME/restored"; }
+'''
+with open(sys.argv[2],'w') as f:
+    f.write(pre+'\n'.join(extract(n) for n in names))
+    f.write('''
+mkdir -p "$STATE_ROOT"
+acquire_lock
+trap on_exit EXIT
+trap on_signal INT TERM
+start_logging
+printf 'fake updater started\\n'
+sleep 20
+printf 'fake updater completed\\n'
+''')
+INTPY
+chmod +x "$INT_FIX/harness.sh"
+INT_HOME="$INT_FIX/home"; mkdir -p "$INT_HOME"
+setsid "$INT_FIX/harness.sh" "$INT_HOME" >"$INT_HOME/terminal.out" 2>&1 &
+INT_PID=$!
+for _ in $(seq 1 40); do
+    grep -q 'fake updater started' "$INT_HOME/terminal.out" 2>/dev/null && break
+    sleep 0.05
+done
+kill -TERM -- "-$INT_PID" 2>/dev/null || kill -TERM "$INT_PID" 2>/dev/null || true
+wait "$INT_PID" 2>/dev/null; INT_RC=$?
+[[ $INT_RC -eq 5 ]] && ok "interrupt returns status 5" || bad "interrupt exit $INT_RC"
+check "interruption is reported, never as completion" \
+    "grep -q '\\[INTERRUPTED\\]' $INT_HOME/terminal.out && ! grep -q 'fake updater completed' $INT_HOME/terminal.out"
+check "OpenCode stopped before interruption is restored" "[[ -e $INT_HOME/restored && -e $INT_HOME/opencode.running ]]"
+check "interruption releases the mutation lock" \
+    "( exec 8>>$INT_HOME/state/update.lock && flock -n 8 )"
+check "interruption removes the lock holder" "[[ ! -e $INT_HOME/state/update.lock.holder ]]"
+sleep 0.1
+check "interruption final rc is retained in the log" \
+    "grep -q 'update finished rc=5' $INT_HOME/logs/*.log"
+rm -rf "$INT_FIX"
 
 printf '\n--- %d passed, %d failed ---\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

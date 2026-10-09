@@ -93,6 +93,7 @@ declare -A PRECHECK=() PRECHECK_DETAIL=()
 declare -A RESULT=()          # component -> PASS|FAIL|SKIPPED|DISABLED|NOT_CONFIGURED
 declare -A RESULT_DETAIL=()   # component -> human readable detail
 declare -A UPDATE_RC=()       # component -> raw rc of its native updater
+declare -A COMPONENT_STARTED=()
 UPDATE_FAILURES=0
 
 # --- Interruption / restoration bookkeeping ------------------------------------
@@ -124,6 +125,8 @@ OPENCODE_BEFORE_START=""
 OPENCODE_BEFORE_VERSION=""
 OPENCODE_BEFORE_EXE=""
 OPENCODE_SERVICE_WAS_RUNNING=0
+OPENCODE_RESTORE_NEEDED=0
+OPENCODE_STOP_IN_PROGRESS=0
 OPENCODE_AFTER_PID=""
 OPENCODE_AFTER_START=""
 OPENCODE_AFTER_EXE=""
@@ -172,7 +175,7 @@ err()  { printf '  %sERROR%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 section() { printf '\n%s=== %s ===%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 
 # Redact anything that looks like a secret before it reaches a log or terminal.
-scrub() { sed -E 's/((token|secret|password|api[_-]?key|authorization)[=: ]+)[^ ]+/\1<REDACTED>/Ig'; }
+scrub() { sed -u -E 's/((token|secret|password|api[_-]?key|authorization)[=: ]+)[^ ]+/\1<REDACTED>/Ig'; }
 
 # Dry-run action prefixes (Phase 13 contract)
 a_stop()    { printf '  %sWOULD STOP%s    %s\n'    "$C_CYN" "$C_RESET" "$*"; }
@@ -194,7 +197,7 @@ record() { # record <component> <status> <detail>
 }
 
 status_line() { # status_line <component> <status> [detail]
-    local comp="$1" st="$2" detail="${3:-}" color=""
+    local comp="$1" st="$2" detail="${3:-}" color="" elapsed=""
     case "$st" in
         PASS)           color="$C_GRN" ;;
         FAIL)           color="$C_RED" ;;
@@ -203,7 +206,18 @@ status_line() { # status_line <component> <status> [detail]
         NOT_CONFIGURED) color="$C_DIM" ;;
         *)              color="" ;;
     esac
-    printf '  %-10s %s%-15s%s %s\n' "$comp" "$color" "$st" "$C_RESET" "$detail"
+    if [[ -n "${COMPONENT_STARTED[$comp]:-}" ]]; then
+        elapsed=" (elapsed: $((SECONDS - COMPONENT_STARTED[$comp]))s)"
+    fi
+    printf '  %-10s %s%-15s%s %s%s\n' "$comp" "$color" "$st" "$C_RESET" "$detail" "$elapsed"
+}
+
+native_failure_reason() { # native_failure_reason <command> <timeout-seconds> <rc>
+    if [[ "$3" -eq 124 ]]; then
+        printf "native '%s' timed out after %ss" "$1" "$2"
+    else
+        printf "native '%s' failed (rc=%s)" "$1" "$3"
+    fi
 }
 
 usage() {
@@ -1530,6 +1544,7 @@ on_exit() {
 }
 
 on_signal() {
+    trap '' INT TERM
     printf '\n[INTERRUPTED] received a termination signal.\n' >&2
 
     # Codex first: a stopped app-server is an outage of the SSH control surface,
@@ -1545,6 +1560,19 @@ on_signal() {
         fi
     fi
 
+    if [[ $DRY_RUN -eq 0 && $OPENCODE_SERVICE_WAS_RUNNING -eq 1 \
+        && ( $OPENCODE_RESTORE_NEEDED -eq 1 || $OPENCODE_STOP_IN_PROGRESS -eq 1 ) ]]; then
+        if [[ -z "$(opencode_service_pid)" ]]; then
+            printf '[INTERRUPTED] this run had stopped the OpenCode service; attempting to restore it...\n' >&2
+            if opencode_restore_service 1 >/dev/null 2>&1; then
+                OPENCODE_RESTORE_NEEDED=0
+                printf '[INTERRUPTED] OpenCode service restore requested.\n' >&2
+            else
+                RESTORE_FAILURES+=("OpenCode service could not be restored after interruption")
+                printf '[INTERRUPTED] OpenCode service could NOT be restored. Check it manually.\n' >&2
+            fi
+        fi
+    fi
     if [[ $IN_MUTATION -eq 1 && $T3_STOPPED_BY_US -eq 1 && $DRY_RUN -eq 0 ]]; then
         printf '[INTERRUPTED] this run had stopped t3code.service; attempting to restore it...\n' >&2
         if systemctl --user start "$T3_UNIT" 2>/dev/null; then
@@ -1589,7 +1617,9 @@ start_logging() {
     #
     #   stdout+stderr -> scrub -> tee -> terminal
     #                                       -> log
-    exec > >(scrub | tee -a "$logf") 2>&1
+    # The logger shares the foreground process group. Ignore update signals so
+    # it can drain the shell's final interruption report and close the log.
+    exec > >(trap '' INT TERM; scrub | tee -p -a "$logf") 2>&1
     LOG_FH_OPEN=1
     ACTIVE_LOG="$logf"
 
@@ -1922,6 +1952,7 @@ do_verify() {
 # =============================================================================
 
 do_codex_update() {
+    COMPONENT_STARTED[codex]=$SECONDS
     section "CODEX"
     if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
         precheck_tool codex
@@ -2144,12 +2175,16 @@ do_codex_update() {
     # 9>&-: the native updater shells out to an installer that may background
     # work. It must not inherit the global lock fd, or a leftover child would
     # keep the flock held after this run exits.
-    if ! "$CODEX_BIN" update 2>&1 9>&- | sed 's/^/    /' 9>&-; then
-        rc=1
+    if timeout --kill-after=30s 900 "$CODEX_BIN" update 2>&1 9>&- | sed -u 's/^/    /' 9>&-; then
+        :
+    else
+        rc=$?
     fi
 
     if [[ $rc -ne 0 ]]; then
-        UPDATE_RESULT="FAILED (native 'codex update' rc=$rc)"
+        local failure
+        failure="$(native_failure_reason 'codex update' 900 "$rc")"
+        UPDATE_RESULT="FAILED ($failure)"
         UPDATE_RC[codex]=$rc
         RESTORE_RESULT="ATTEMPTED after the failed update"
         if [[ $CODEX_RESTORE_NEEDED -eq 1 ]]; then
@@ -2158,8 +2193,8 @@ do_codex_update() {
         fi
         t3_restore_if_stopped || true
         VERIFY_RESULT="$(codex_verify_after_failure)"
-        record codex FAIL "native 'codex update' failed (rc=$rc)"
-        status_line codex FAIL "native 'codex update' failed (rc=$rc)"
+        record codex FAIL "$failure"
+        status_line codex FAIL "$failure"
         IN_MUTATION=0
         return 0
     fi
@@ -2287,6 +2322,7 @@ codex_verify_after_failure() {
 # =============================================================================
 
 do_opencode_update() {
+    COMPONENT_STARTED[opencode]=$SECONDS
     section "OPENCODE V2"
     if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
         precheck_tool opencode
@@ -2412,12 +2448,16 @@ do_opencode_update() {
         info "T3 owns no OpenCode child; t3code.service left running"
     fi
 
+    OPENCODE_STOP_IN_PROGRESS=1
     if ! opencode_stop_service "$OPENCODE_BEFORE_PID" "$OPENCODE_BEFORE_START"; then
+        OPENCODE_STOP_IN_PROGRESS=0
         record opencode FAIL "background service PID ${OPENCODE_BEFORE_PID:-?} could not be stopped; 'opencode upgrade' was not run"
         status_line opencode FAIL "service PID ${OPENCODE_BEFORE_PID:-?} would not stop; upgrade not attempted"
         t3_restore_if_stopped || true
         return 0
     fi
+    OPENCODE_STOP_IN_PROGRESS=0
+    [[ $OPENCODE_SERVICE_WAS_RUNNING -eq 1 ]] && OPENCODE_RESTORE_NEEDED=1
 
     if [[ ${#targets[@]} -gt 0 ]]; then
         terminate_pids "opencode" "${targets[@]}" || true
@@ -2427,7 +2467,7 @@ do_opencode_update() {
     if ! opencode_pre_update_proof "$OPENCODE_BEFORE_PID" "$OPENCODE_BEFORE_START"; then
         record opencode FAIL "pre-update proof failed; 'opencode upgrade' was not run"
         status_line opencode FAIL "pre-update proof failed; upgrade not attempted"
-        opencode_restore_service "$OPENCODE_SERVICE_WAS_RUNNING" || true
+        if opencode_restore_service "$OPENCODE_SERVICE_WAS_RUNNING"; then OPENCODE_RESTORE_NEEDED=0; fi
         t3_restore_if_stopped || true
         return 0
     fi
@@ -2436,21 +2476,25 @@ do_opencode_update() {
     IN_MUTATION=1
     local rc=0
     info "Running: opencode upgrade"
-    if ! "$OPENCODE_BIN" upgrade 9>&- 2>&1 | sed 's/^/    /'; then
-        rc=1
+    if timeout --kill-after=30s 900 "$OPENCODE_BIN" upgrade 9>&- 2>&1 | sed -u 's/^/    /'; then
+        :
+    else
+        rc=$?
     fi
     UPDATE_RC[opencode]=$rc
     if [[ $rc -ne 0 ]]; then
-        record opencode FAIL "native 'opencode upgrade' failed (rc=$rc)"
-        status_line opencode FAIL "native 'opencode upgrade' failed (rc=$rc)"
-        opencode_restore_service "$OPENCODE_SERVICE_WAS_RUNNING" || true
+        local failure
+        failure="$(native_failure_reason 'opencode upgrade' 900 "$rc")"
+        record opencode FAIL "$failure"
+        status_line opencode FAIL "$failure"
+        if opencode_restore_service "$OPENCODE_SERVICE_WAS_RUNNING"; then OPENCODE_RESTORE_NEEDED=0; fi
         t3_restore_if_stopped || true
         IN_MUTATION=0
         return 0
     fi
 
     # ---- Restore --------------------------------------------------------------
-    opencode_restore_service "$OPENCODE_SERVICE_WAS_RUNNING" || true
+    if opencode_restore_service "$OPENCODE_SERVICE_WAS_RUNNING"; then OPENCODE_RESTORE_NEEDED=0; fi
 
     # ---- Freshness + verification ---------------------------------------------
     # Run once and keep the verdict: the function returns the failure text on
@@ -2481,6 +2525,7 @@ do_opencode_update() {
 # =============================================================================
 
 do_hermes_update() {
+    COMPONENT_STARTED[hermes]=$SECONDS
     section "HERMES"
     if [[ $DRY_RUN -eq 0 && $FORCE_UPDATE -eq 0 ]]; then
         precheck_tool hermes
@@ -2528,13 +2573,17 @@ do_hermes_update() {
     IN_MUTATION=1
     local rc=0
     info "Running: hermes update --yes --no-backup   (--no-backup: no custom state backup)"
-    if ! "$HERMES_BIN" update --yes --no-backup 9>&- 2>&1 | sed 's/^/    /'; then
-        rc=1
+    if timeout --kill-after=30s 900 "$HERMES_BIN" update --yes --no-backup 9>&- 2>&1 | sed -u 's/^/    /'; then
+        :
+    else
+        rc=$?
     fi
     UPDATE_RC[hermes]=$rc
     if [[ $rc -ne 0 ]]; then
-        record hermes FAIL "native 'hermes update' failed (rc=$rc)"
-        status_line hermes FAIL "native 'hermes update' failed (rc=$rc)"
+        local failure
+        failure="$(native_failure_reason 'hermes update --yes --no-backup' 900 "$rc")"
+        record hermes FAIL "$failure"
+        status_line hermes FAIL "$failure"
         for u in "${was_active[@]}"; do
             unit_start "$u" || RESTORE_FAILURES+=("$u failed to start")
         done
@@ -2565,6 +2614,7 @@ do_hermes_update() {
 # =============================================================================
 
 do_t3_update() {
+    COMPONENT_STARTED[t3]=$SECONDS
     section "T3"
     if [[ -z "$T3_BIN" ]]; then
         record t3 SKIPPED "t3 not installed on PATH"
@@ -2605,13 +2655,17 @@ do_t3_update() {
     local rc=0
     warn_t3_workloads
     info "Running: t3 update --channel nightly --yes"
-    if ! "$T3_BIN" update --channel nightly --yes 9>&- 2>&1 | sed 's/^/    /'; then
-        rc=1
+    if timeout --kill-after=30s 900 "$T3_BIN" update --channel nightly --yes 9>&- 2>&1 | sed -u 's/^/    /'; then
+        :
+    else
+        rc=$?
     fi
     UPDATE_RC[t3]=$rc
     if [[ $rc -ne 0 ]]; then
-        record t3 FAIL "native 't3 update' failed (rc=$rc)"
-        status_line t3 FAIL "native 't3 update' failed (rc=$rc)"
+        local failure
+        failure="$(native_failure_reason 't3 update --channel nightly --yes' 900 "$rc")"
+        record t3 FAIL "$failure"
+        status_line t3 FAIL "$failure"
         t3_active || systemctl --user start "$T3_UNIT" 2>/dev/null || \
             RESTORE_FAILURES+=("t3code.service failed to start after failed update")
         IN_MUTATION=0
@@ -2770,10 +2824,6 @@ cleanup_codex_releases() {
         fi
     done <<< "$sorted"
 }
-
-# =============================================================================
-# Reporting
-# =============================================================================
 
 # =============================================================================
 # Reporting
@@ -3012,7 +3062,7 @@ main() {
     local run_id
     run_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
 
-    printf '%s%s%s %s v%s%s\n' "$C_BOLD" "$SCRIPT_NAME" "$C_RESET" "v$SCRIPT_VERSION" "" "$C_RESET"
+    printf '%s%s%s %s%s\n' "$C_BOLD" "$SCRIPT_NAME" "$C_RESET" "v$SCRIPT_VERSION" "$C_RESET"
     printf '%srun %s%s\n' "$C_DIM" "$run_id" "$C_RESET"
     if [[ $DRY_RUN -eq 1 ]]; then
         printf '%s*** DRY RUN — no changes will be made ***%s\n' "$C_YEL" "$C_RESET"
